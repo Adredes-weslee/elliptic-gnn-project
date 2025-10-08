@@ -37,6 +37,18 @@ python -m src.data.build_graph --config configs/split.yaml
 
 This writes `data/processed/graph.pt` and `data/processed/meta.json`.
 
+## EDA & Checks
+
+Generate quick sanity tables (degree histogram and labels by timestep) and
+optionally enforce that every edge stays within a single timestep:
+
+```bash
+python -m src.analysis.eda --processed_dir data/processed --assert_no_cross_time_edges
+```
+
+The script writes `degree_hist.csv` and `labels_by_time.csv` alongside the
+processed graph and prints a short summary.
+
 ## 3) Baselines
 
 Logistic regression:
