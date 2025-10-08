@@ -1,33 +1,35 @@
-run_name: gat_h64
+run_name: gat_w10_time
 seed: 42
 processed_dir: data/processed
 
-device: auto   # auto | cpu | cuda
-amp: true      # use torch.cuda.amp on CUDA
-grad_clip: 1.0 # 0 disables
-
+# Model
 arch: gat
-hidden_dim: 64
+hidden_dim: 32           # 32 * 4 heads = 128 total width per layer
 layers: 2
 heads: 4
-dropout: 0.4
-weight_decay: 5.0e-5
-lr: 5.0e-4
-max_epochs: 250
-patience: 25
-mini_batch: false
-fanout: [10, 10]
-batch_size: 8192
+dropout: 0.5
 
+# Training
+lr: 0.003
+weight_decay: 0.0001
+max_epochs: 300
+patience: 60             # GAT can need a bit more patience
+grad_clip: 1.0
+device: auto
+amp: true
+
+# Data/time
+symmetrize_edges: false
+use_time_scalar: true
+train_window_k: 10
+
+# Loss
 class_weight_pos: auto
-focal_loss: false
+focal_loss: false        # try true if logits are very peaky; add focal_gamma: 2.0
 
+# Evaluation
 use_val_for_thresholds: true
-precision_target: 0.90
+precision_target: 0.75
 topk: 100
 
-calibrate_temperature: true
 ablate_hubs_frac: 0.0
-symmetrize_edges: false
-use_time_scalar: false
-train_window_k: null   # e.g., 6 trains on last 6 steps of train period
