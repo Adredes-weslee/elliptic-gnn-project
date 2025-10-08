@@ -12,13 +12,18 @@ from typing import Dict, Tuple
 import torch
 
 
-def load_processed_graph(processed_dir: Path) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+def load_processed_graph(
+    processed_dir: Path,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
     """Load the cached graph tensors from ``processed_dir``.
 
-    Returns the ``edge_index`` (``[2, E]``), node labels ``y``, timesteps, and the
-    loaded ``meta`` dictionary.
-    """
+    Returns:
+        edge_index ([2, E] long tensor), y (long), timestep (long), meta (dict)
 
+    Notes:
+        PyTorch 2.6+ defaults torch.load(weights_only=True), which blocks unpickling
+        torch_geometric Data objects. We explicitly set weights_only=False (trusted local file).
+    """
     graph_path = processed_dir / "graph.pt"
     meta_path = processed_dir / "meta.json"
 
@@ -27,16 +32,30 @@ def load_processed_graph(processed_dir: Path) -> Tuple[torch.Tensor, torch.Tenso
     if not meta_path.exists():
         raise FileNotFoundError(f"Missing meta information at {meta_path}")
 
-    data = torch.load(graph_path, map_location="cpu")
+    # Handle PyTorch 2.6+ change (weights_only default). Backwards compatible.
+    import inspect
+
+    load_sig = inspect.signature(torch.load)
+    load_kwargs = {"map_location": "cpu"}
+    if "weights_only" in load_sig.parameters:
+        load_kwargs["weights_only"] = False
+
+    try:
+        data = torch.load(graph_path, **load_kwargs)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load {graph_path}. If this persists, ensure the file was created "
+            f"with torch.save(Data(...)). Under PyTorch>=2.6 we force weights_only=False. Original error: {e}"
+        ) from e
+
     with open(meta_path, "r") as f:
         meta = json.load(f)
 
-    if not hasattr(data, "edge_index"):
-        raise AttributeError("Loaded data object has no 'edge_index' attribute")
-    if not hasattr(data, "y"):
-        raise AttributeError("Loaded data object has no 'y' attribute")
-    if not hasattr(data, "timestep"):
-        raise AttributeError("Loaded data object has no 'timestep' attribute")
+    for attr in ("edge_index", "y", "timestep"):
+        if not hasattr(data, attr):
+            raise AttributeError(
+                f"Loaded data object missing required attribute '{attr}'"
+            )
 
     edge_index = data.edge_index.to(torch.long)
     y = data.y.to(torch.long)
@@ -45,7 +64,9 @@ def load_processed_graph(processed_dir: Path) -> Tuple[torch.Tensor, torch.Tenso
     return edge_index, y, timestep, meta
 
 
-def write_degree_histogram(edge_index: torch.Tensor, num_nodes: int, out_path: Path) -> None:
+def write_degree_histogram(
+    edge_index: torch.Tensor, num_nodes: int, out_path: Path
+) -> None:
     """Compute degree counts (treating edges as undirected) and persist to CSV."""
 
     if edge_index.numel() == 0:
@@ -86,7 +107,9 @@ def write_labels_by_time(
     return total_illicit, total_licit, total_unknown
 
 
-def assert_no_cross_time_edges(edge_index: torch.Tensor, timestep: torch.Tensor) -> None:
+def assert_no_cross_time_edges(
+    edge_index: torch.Tensor, timestep: torch.Tensor
+) -> None:
     """Ensure every edge connects nodes from the same timestep."""
 
     if edge_index.numel() == 0:
@@ -113,7 +136,6 @@ def assert_no_cross_time_edges(edge_index: torch.Tensor, timestep: torch.Tensor)
     sys.exit(1)
 
 
-
 def main(processed_dir: Path, check_cross_time: bool) -> None:
     edge_index, y, timestep, meta = load_processed_graph(processed_dir)
     num_nodes = int(meta.get("num_nodes", y.size(0)))
@@ -137,7 +159,9 @@ def main(processed_dir: Path, check_cross_time: bool) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="EDA and sanity checks for the processed Elliptic graph")
+    parser = argparse.ArgumentParser(
+        description="EDA and sanity checks for the processed Elliptic graph"
+    )
     parser.add_argument(
         "--processed_dir",
         type=Path,
