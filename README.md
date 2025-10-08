@@ -166,7 +166,7 @@ you can also use the standalone script if included:
 python -m src.analysis.hub_ablation --run_dir outputs/gnn/gcn_h64 --frac 0.01
 ```
 
-(Optional) Robustness (edge-drop & feature noise) if added:
+Robustness (random edge drop + feature noise):
 
 ```bash
 python -m src.analysis.robustness --run_dir outputs/gnn/gcn_h64 --drop_frac 0.10 --noise_std 0.01
