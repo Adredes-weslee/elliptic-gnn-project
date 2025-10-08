@@ -7,7 +7,7 @@ model: xgboost
 calibration: isotonic   # isotonic | platt | none
 
 use_val_for_thresholds: true
-precision_target: 0.90
+precision_target: 0.75
 topk: 100
 
 n_estimators: 600

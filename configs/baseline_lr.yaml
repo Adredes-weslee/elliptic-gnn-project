@@ -7,7 +7,7 @@ model: logistic_regression
 calibration: isotonic   # isotonic | platt | none
 
 use_val_for_thresholds: true
-precision_target: 0.90  # if >0, choose threshold to hit this precision; else max-F1
+precision_target: 0.75  # if >0, choose threshold to hit this precision; else max-F1
 topk: 100               # Precision@K on test
 
 C: 1.0
