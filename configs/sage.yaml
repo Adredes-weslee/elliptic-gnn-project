@@ -1,0 +1,22 @@
+
+run_name: sage_h128
+seed: 42
+processed_dir: data/processed
+
+arch: sage
+hidden_dim: 128
+layers: 2
+dropout: 0.3
+weight_decay: 1.0e-4
+lr: 1.0e-3
+max_epochs: 200
+patience: 20
+
+class_weight_pos: auto
+focal_loss: false
+
+use_val_for_thresholds: true
+precision_target: 0.90
+topk: 100
+
+calibrate_temperature: true

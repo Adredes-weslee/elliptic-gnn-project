@@ -1,0 +1,19 @@
+
+run_name: xgb_default
+seed: 42
+processed_dir: data/processed
+
+model: xgboost
+calibration: isotonic   # isotonic | platt | none
+
+use_val_for_thresholds: true
+precision_target: 0.90
+topk: 100
+
+n_estimators: 600
+max_depth: 6
+learning_rate: 0.05
+subsample: 0.8
+colsample_bytree: 0.8
+eval_metric: logloss
+tree_method: auto       # set 'gpu_hist' to force GPU

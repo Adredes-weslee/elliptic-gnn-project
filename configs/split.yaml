@@ -1,0 +1,16 @@
+
+# Temporal split for masks:
+# Train: 1..34, Val: 35..43, Test: 44..49  (adjust if needed)
+seed: 42
+t_train_end: 34
+t_val_end: 43
+t_max: 49
+
+# Data paths
+data_dir: data/raw
+processed_dir: data/processed
+
+# Filenames
+features_csv: elliptic_txs_features.csv
+classes_csv: elliptic_txs_classes.csv
+edgelist_csv: elliptic_txs_edgelist.csv

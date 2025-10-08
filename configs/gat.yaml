@@ -1,0 +1,23 @@
+
+run_name: gat_h64
+seed: 42
+processed_dir: data/processed
+
+arch: gat
+hidden_dim: 64
+layers: 2
+heads: 4
+dropout: 0.4
+weight_decay: 5.0e-5
+lr: 5.0e-4
+max_epochs: 250
+patience: 25
+
+class_weight_pos: auto
+focal_loss: false
+
+use_val_for_thresholds: true
+precision_target: 0.90
+topk: 100
+
+calibrate_temperature: true

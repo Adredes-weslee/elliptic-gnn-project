@@ -1,0 +1,23 @@
+
+name: elliptic-gnn
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch>=2.2
+  - pytorch-cuda=11.8    # replace with 'cpuonly' if no NVIDIA GPU/CUDA
+  - numpy
+  - pandas
+  - scikit-learn
+  - scipy
+  - matplotlib
+  - pyyaml
+  - tqdm
+  - networkx
+  - xgboost
+  - pip
+  - pip:
+      - torch-geometric
+      - imbalanced-learn
