@@ -78,6 +78,24 @@ View TensorBoard with:
 tensorboard --logdir outputs/gnn/<run_name>/tb
 ```
 
+## Analysis
+
+After training, run the analysis scripts on a directory that contains
+`metrics.json`, `scores_test.npy`, `y_test.npy`, and `timestep_test.npy`
+(for example `outputs/gnn/<run_name>/`). Each script writes a CSV summary
+and saves a PNG plot alongside the run artifacts.
+
+```bash
+# Per-timestep drift analysis
+python src/analysis/eval_by_time.py --run_dir outputs/gnn/<run_name>
+
+# Calibration reliability curve
+python src/analysis/calibration_plots.py --run_dir outputs/gnn/<run_name>
+
+# Precision-vs-workload curve (adjust --k_max as needed)
+python src/analysis/workload_curves.py --run_dir outputs/gnn/<run_name> --k_max 5000
+```
+
 ## 5) Repo layout
 
 ```
