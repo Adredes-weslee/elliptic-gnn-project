@@ -37,6 +37,18 @@ python -m src.data.build_graph --config configs/split.yaml
 
 This writes `data/processed/graph.pt` and `data/processed/meta.json`.
 
+## EDA & Checks
+
+Generate quick sanity tables (degree histogram and labels by timestep) and
+optionally enforce that every edge stays within a single timestep:
+
+```bash
+python -m src.analysis.eda --processed_dir data/processed --assert_no_cross_time_edges
+```
+
+The script writes `degree_hist.csv` and `labels_by_time.csv` alongside the
+processed graph and prints a short summary.
+
 ## 3) Baselines
 
 Logistic regression:
@@ -63,7 +75,53 @@ python -m src.train_gnn --config configs/sage.yaml
 python -m src.train_gnn --config configs/gat.yaml
 ```
 
+On a CUDA machine you should see startup logs similar to:
+
+```
+[GPU] CUDA available: 1 device(s) -> ['NVIDIA ...'], torch.version.cuda=...
+[RUN] Using device: cuda
+```
+
 Artifacts: `outputs/gnn/<run_name>/metrics.json` and `best.ckpt`.
+
+View TensorBoard with:
+
+```
+tensorboard --logdir outputs/gnn/<run_name>/tb
+```
+
+## Analysis
+
+After training, run the analysis scripts on a directory that contains
+`metrics.json`, `scores_test.npy`, `y_test.npy`, and `timestep_test.npy`
+(for example `outputs/gnn/<run_name>/`). Each script writes a CSV summary
+and saves a PNG plot alongside the run artifacts.
+
+```bash
+# Per-timestep drift analysis
+python src/analysis/eval_by_time.py --run_dir outputs/gnn/<run_name>
+
+# Calibration reliability curve
+python src/analysis/calibration_plots.py --run_dir outputs/gnn/<run_name>
+
+# Precision-vs-workload curve (adjust --k_max as needed)
+python src/analysis/workload_curves.py --run_dir outputs/gnn/<run_name> --k_max 5000
+```
+
+## Interpretability
+
+Explainability examples for the baseline XGBoost model and trained GNNs.
+
+```bash
+# SHAP summary for an XGBoost baseline run (re-uses the saved model if available)
+python -m src.analysis.explain xgb --run_dir outputs/baselines/xgb_default --max_plots 10
+
+# GNNExplainer visualization for a specific node
+python -m src.analysis.explain gnn --run_dir outputs/gnn/<run_name> --node 12345
+
+# Let the script auto-pick a high-confidence true/false positive for explanation
+python -m src.analysis.explain gnn --run_dir outputs/gnn/<run_name>
+```
 
 ## 5) Repo layout
 

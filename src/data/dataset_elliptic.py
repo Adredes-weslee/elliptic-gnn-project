@@ -1,4 +1,6 @@
 
+from __future__ import annotations
+
 import os
 import pandas as pd
 import torch
@@ -89,7 +91,12 @@ def load_elliptic_as_graph(
     }
     return data, meta
 
-def make_temporal_masks(data: Data, t_train_end: int, t_val_end: int):
+def make_temporal_masks(
+    data: Data,
+    t_train_end: int,
+    t_val_end: int,
+    train_window_k: int | None = None,
+):
     # Build boolean masks over nodes for train/val/test using labeled nodes only.
     y = data.y
     t = data.timestep
@@ -98,6 +105,10 @@ def make_temporal_masks(data: Data, t_train_end: int, t_val_end: int):
     train_mask = (t <= t_train_end) & labeled
     val_mask = (t > t_train_end) & (t <= t_val_end) & labeled
     test_mask = (t > t_val_end) & labeled
+
+    if train_window_k is not None:
+        t_lo = max(1, t_train_end - train_window_k + 1)
+        train_mask = (t >= t_lo) & (t <= t_train_end) & labeled
 
     data.train_mask = train_mask
     data.val_mask = val_mask

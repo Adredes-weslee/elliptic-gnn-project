@@ -10,7 +10,27 @@ from src.utils.metrics import (
     pr_auc_illicit, roc_auc_illicit, precision_at_k, pick_threshold_max_f1,
     pick_threshold_for_precision, f1_at_threshold, expected_calibration_error, recall_at_precision
 )
-from src.utils.calibrate import calibrate_isotonic, calibrate_platt
+
+
+def pick_tree_method():
+    try:
+        import torch
+        return "gpu_hist" if torch.cuda.is_available() else "hist"
+    except Exception:
+        return "hist"
+
+
+def make_calibrator(calibration: str, p_val, y_val):
+    from src.utils.calibrate import calibrate_isotonic, calibrate_platt
+
+    calibration = (calibration or "none").lower()
+    if calibration == "isotonic":
+        cal = calibrate_isotonic(p_val, y_val)
+        return cal, (lambda s: cal.transform(s))
+    if calibration == "platt":
+        cal = calibrate_platt(p_val, y_val)
+        return cal, (lambda s: cal.predict_proba(s.reshape(-1, 1))[:, 1])
+    return None, (lambda s: s)
 
 def load_cached(processed_dir):
     data = torch.load(os.path.join(processed_dir, "graph.pt"), map_location="cpu")
@@ -19,10 +39,10 @@ def load_cached(processed_dir):
 def get_split_arrays(data):
     x = data.x.numpy()
     y = data.y.numpy()
-    labeled = y >= 0
-    feats = x[labeled]
-    labels = y[labeled]
-    t = data.timestep.numpy()[labeled]
+    labeled_idx = np.where(y >= 0)[0]
+    feats = x[labeled_idx]
+    labels = y[labeled_idx]
+    t = data.timestep.numpy()[labeled_idx]
 
     t_train_end = int(torch.max(data.timestep[data.train_mask]).item())
     t_val_end = int(torch.max(data.timestep[data.val_mask]).item())
@@ -30,7 +50,7 @@ def get_split_arrays(data):
     train = t <= t_train_end
     val = (t > t_train_end) & (t <= t_val_end)
     test = t > t_val_end
-    return feats, labels, train, val, test
+    return feats, labels, train, val, test, labeled_idx, t
 
 def main(cfg):
     set_seed(cfg.get("seed", 42))
@@ -38,7 +58,18 @@ def main(cfg):
     ensure_dir(outdir)
 
     data = load_cached(cfg["processed_dir"])
-    X, y, train_mask, val_mask, test_mask = get_split_arrays(data)
+    X, y, train_mask, val_mask, test_mask, labeled_idx, timesteps = get_split_arrays(data)
+
+    window_k = cfg.get("train_window_k")
+    if window_k is not None:
+        window_k = int(window_k)
+        train_timesteps = timesteps[train_mask]
+        if train_timesteps.size == 0:
+            raise RuntimeError("Train mask is empty; cannot apply rolling window.")
+        T = int(train_timesteps.max())
+        t_lo = max(1, T - window_k + 1)
+        in_window = (timesteps >= t_lo) & (timesteps <= T)
+        train_mask = train_mask & in_window
 
     Xtr, ytr = X[train_mask], y[train_mask]
     Xva, yva = X[val_mask], y[val_mask]
@@ -51,6 +82,10 @@ def main(cfg):
             ("clf", LogisticRegression(max_iter=cfg.get("max_iter",2000), C=cfg.get("C",1.0)))
         ])
     elif model_name == "xgboost":
+        method = cfg.get("tree_method", "auto")
+        if method == "auto":
+            method = pick_tree_method()
+        print(f"[XGB] tree_method={method}")
         model = XGBClassifier(
             n_estimators=cfg.get("n_estimators",600),
             max_depth=cfg.get("max_depth",6),
@@ -58,7 +93,7 @@ def main(cfg):
             subsample=cfg.get("subsample",0.8),
             colsample_bytree=cfg.get("colsample_bytree",0.8),
             eval_metric=cfg.get("eval_metric","logloss"),
-            tree_method=cfg.get("tree_method","auto")
+            tree_method=method
         )
     else:
         raise ValueError("Unknown baseline model")
@@ -79,19 +114,19 @@ def main(cfg):
     p_te = predict_proba(model, Xte)
 
     # Calibration (optional)
-    cal = cfg.get("calibration","none")
-    if cal == "isotonic":
-        calibrator = calibrate_isotonic(p_va, yva)
-        p_te_cal = calibrator.transform(p_te)
-        p_va_cal = calibrator.transform(p_va)
-    elif cal == "platt":
-        calibrator = calibrate_platt(p_va, yva)
-        p_te_cal = calibrator.predict_proba(p_te.reshape(-1,1))[:,1]
-        p_va_cal = calibrator.predict_proba(p_va.reshape(-1,1))[:,1]
-    else:
-        calibrator = None
-        p_te_cal = p_te
-        p_va_cal = p_va
+    print(f"[CAL] calibration={cfg.get('calibration','none')}")
+    calibrator, transform = make_calibrator(cfg.get("calibration", "none"), p_va, yva)
+    p_va_cal = transform(p_va)
+    p_te_cal = transform(p_te)
+
+    np.save(os.path.join(outdir, "scores_val.npy"), p_va_cal)
+    np.save(os.path.join(outdir, "y_val.npy"), yva)
+    np.save(os.path.join(outdir, "node_idx_val.npy"), labeled_idx[val_mask])
+    np.save(os.path.join(outdir, "timestep_val.npy"), timesteps[val_mask])
+    np.save(os.path.join(outdir, "scores_test.npy"), p_te_cal)
+    np.save(os.path.join(outdir, "y_test.npy"), yte)
+    np.save(os.path.join(outdir, "node_idx_test.npy"), labeled_idx[test_mask])
+    np.save(os.path.join(outdir, "timestep_test.npy"), timesteps[test_mask])
 
     # Threshold selection on validation
     if cfg.get("use_val_for_thresholds", True):

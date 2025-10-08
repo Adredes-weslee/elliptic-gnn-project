@@ -9,10 +9,13 @@ dependencies:
   - scikit-learn
   - scipy
   - matplotlib
+  - shap
+  - pytest
   - pyyaml
   - tqdm
   - networkx
   - xgboost
+  - tensorboard
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu126   # CUDA 12.6 wheels

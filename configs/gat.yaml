@@ -1,7 +1,10 @@
-
 run_name: gat_h64
 seed: 42
 processed_dir: data/processed
+
+device: auto   # auto | cpu | cuda
+amp: true      # use torch.cuda.amp on CUDA
+grad_clip: 1.0 # 0 disables
 
 arch: gat
 hidden_dim: 64
@@ -12,6 +15,9 @@ weight_decay: 5.0e-5
 lr: 5.0e-4
 max_epochs: 250
 patience: 25
+mini_batch: false
+fanout: [10, 10]
+batch_size: 8192
 
 class_weight_pos: auto
 focal_loss: false
@@ -21,3 +27,7 @@ precision_target: 0.90
 topk: 100
 
 calibrate_temperature: true
+ablate_hubs_frac: 0.0
+symmetrize_edges: false
+use_time_scalar: false
+train_window_k: null   # e.g., 6 trains on last 6 steps of train period
