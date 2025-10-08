@@ -1,0 +1,32 @@
+run_name: sage_l3_k6
+seed: 42
+processed_dir: data/processed
+
+device: auto      # auto | cpu | cuda
+amp: true         # use torch.cuda.amp on CUDA
+grad_clip: 1.0
+
+arch: sage
+hidden_dim: 128
+layers: 3         # <-- was 2
+dropout: 0.30
+weight_decay: 1.0e-4
+lr: 1.0e-3
+max_epochs: 250
+patience: 30      # a touch higher for 3 layers
+mini_batch: false
+fanout: [10, 10]
+batch_size: 8192
+
+class_weight_pos: auto
+focal_loss: false
+
+use_val_for_thresholds: true
+precision_target: 0.0    # 0.0 = choose max-F1 on val; set 0.75 to operate at 75% precision
+topk: 100
+
+calibrate_temperature: true
+ablate_hubs_frac: 0.0
+symmetrize_edges: false
+use_time_scalar: true     # <-- time hint appended to features
+train_window_k: 6         # <-- rolling train on most recent 6 steps

@@ -1,0 +1,32 @@
+run_name: sage_l3_k14
+seed: 42
+processed_dir: data/processed
+
+device: auto
+amp: true
+grad_clip: 1.0
+
+arch: sage
+hidden_dim: 128
+layers: 3
+dropout: 0.40
+weight_decay: 5.0e-5 
+lr: 1.0e-3
+max_epochs: 250
+patience: 40
+mini_batch: false
+fanout: [10, 10]
+batch_size: 8192
+
+class_weight_pos: auto
+focal_loss: false
+
+use_val_for_thresholds: true
+precision_target: 0.0
+topk: 100
+
+calibrate_temperature: true
+ablate_hubs_frac: 0.0
+symmetrize_edges: true
+use_time_scalar: true
+train_window_k: 18
