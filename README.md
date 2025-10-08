@@ -280,3 +280,10 @@ My recommendation: **test first** with a small run to confirm the plumbing (GPU/
 
 If you want, I can also give you prompts to add a Dockerfile + Makefile + pre-commit (ruff/black) for smooth grading and reproducibility.
 
+### Streamlit dashboard
+```bash
+streamlit run app/streamlit_app.py
+```
+
+Select a run under outputs/ to explore metrics, curves, and comparisons.
+
