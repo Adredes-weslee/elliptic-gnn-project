@@ -1,0 +1,42 @@
+run_name: sage_resbn_k14_te8
+seed: 42
+processed_dir: data/processed
+
+device: auto
+amp: true
+grad_clip: 1.0
+
+arch: sage_resbn         # <— NEW
+hidden_dim: 128
+layers: 3
+dropout: 0.2
+weight_decay: 5.0e-5
+lr: 5.0e-4
+max_epochs: 300
+patience: 40
+
+# time embedding inside the model
+time_embed_dim: 8        # <— NEW
+max_timestep: 49
+use_time_scalar: false   # turn off scalar time when using embedding
+
+# graph handling
+symmetrize_edges: true
+train_window_k: 14
+
+# full-batch
+mini_batch: false
+fanout: [10, 10]
+batch_size: 8192
+
+# loss
+class_weight_pos: auto
+focal_loss: false
+
+# eval & calibration
+use_val_for_thresholds: true
+precision_target: 0.90
+topk: 100
+calibrate_temperature: true
+
+ablate_hubs_frac: 0.0
