@@ -1,8 +1,7 @@
-
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, SAGEConv, GATConv
+from torch_geometric.nn import GATConv, GCNConv, SAGEConv
+
 
 class GCNNet(nn.Module):
     def __init__(self, in_dim, hidden_dim=64, layers=2, dropout=0.3, num_classes=2):
@@ -22,6 +21,7 @@ class GCNNet(nn.Module):
         x = self.convs[-1](x, edge_index)
         return x  # logits
 
+
 class SAGENet(nn.Module):
     def __init__(self, in_dim, hidden_dim=64, layers=2, dropout=0.3, num_classes=2):
         super().__init__()
@@ -40,8 +40,11 @@ class SAGENet(nn.Module):
         x = self.convs[-1](x, edge_index)
         return x
 
+
 class GATNet(nn.Module):
-    def __init__(self, in_dim, hidden_dim=64, layers=2, heads=4, dropout=0.3, num_classes=2):
+    def __init__(
+        self, in_dim, hidden_dim=64, layers=2, heads=4, dropout=0.3, num_classes=2
+    ):
         super().__init__()
         self.dropout = dropout
         self.layers = layers
@@ -52,9 +55,15 @@ class GATNet(nn.Module):
         self.gats.append(GATConv(in_dim, hidden_dim, heads=heads, dropout=dropout))
         # middle
         for _ in range(layers - 2):
-            self.gats.append(GATConv(hidden_dim * heads, hidden_dim, heads=heads, dropout=dropout))
+            self.gats.append(
+                GATConv(hidden_dim * heads, hidden_dim, heads=heads, dropout=dropout)
+            )
         # final
-        self.gats.append(GATConv(hidden_dim * heads, num_classes, heads=1, concat=False, dropout=dropout))
+        self.gats.append(
+            GATConv(
+                hidden_dim * heads, num_classes, heads=1, concat=False, dropout=dropout
+            )
+        )
 
     def forward(self, x, edge_index):
         for conv in self.gats[:-1]:
