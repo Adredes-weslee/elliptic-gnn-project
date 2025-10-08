@@ -15,6 +15,9 @@ weight_decay: 5.0e-5
 lr: 5.0e-4
 max_epochs: 250
 patience: 25
+mini_batch: false
+fanout: [10, 10]
+batch_size: 8192
 
 class_weight_pos: auto
 focal_loss: false
