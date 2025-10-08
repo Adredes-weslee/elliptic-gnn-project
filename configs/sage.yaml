@@ -1,7 +1,10 @@
-
 run_name: sage_h128
 seed: 42
 processed_dir: data/processed
+
+device: auto   # auto | cpu | cuda
+amp: true      # use torch.cuda.amp on CUDA
+grad_clip: 1.0 # 0 disables
 
 arch: sage
 hidden_dim: 128

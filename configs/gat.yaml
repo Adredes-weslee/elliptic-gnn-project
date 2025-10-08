@@ -1,7 +1,10 @@
-
 run_name: gat_h64
 seed: 42
 processed_dir: data/processed
+
+device: auto   # auto | cpu | cuda
+amp: true      # use torch.cuda.amp on CUDA
+grad_clip: 1.0 # 0 disables
 
 arch: gat
 hidden_dim: 64
