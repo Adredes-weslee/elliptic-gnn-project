@@ -186,7 +186,7 @@ def main(cfg):
 
     # Loss
     if cfg.get("focal_loss", False):
-        gamma = 2.0
+        gamma = float(cfg.get("focal_gamma", 2.0))
         def focal_loss(logits, target):
             ce = F.cross_entropy(logits, target, reduction="none")
             pt = torch.softmax(logits, dim=1)[torch.arange(len(target)), target]
