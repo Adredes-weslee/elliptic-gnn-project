@@ -72,6 +72,12 @@ On a CUDA machine you should see startup logs similar to:
 
 Artifacts: `outputs/gnn/<run_name>/metrics.json` and `best.ckpt`.
 
+View TensorBoard with:
+
+```
+tensorboard --logdir outputs/gnn/<run_name>/tb
+```
+
 ## 5) Repo layout
 
 ```

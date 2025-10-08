@@ -17,6 +17,7 @@ dependencies:
   - tqdm
   - networkx
   - xgboost
+  - tensorboard
   - pip
   - pip:
       - torch-geometric
