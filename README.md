@@ -1,6 +1,3 @@
-You’re super close. The two snippets you shared (EDA + baselines) look solid. The weak spot that explains your earlier `num_edges: 0` is almost certainly the **dataset loader** (not shown here): it likely assumes the second column of `elliptic_txs_features.csv` is `timestep`. In the official dump, the **timestep lives in `elliptic_txs_classes.csv`** (often as `time_step`) and the **features file is `txId + 166 features`**. If you treat a *feature* column as timestep, your edgelist-to-node mapping goes sideways and you can end up dropping every edge.
-
-Below is (1) the **updated README** block with step-by-step “what to run” + what to expect, and (2) a **Codex patch** to make the dataset loader bullet-proof against headers/dtypes and to source `timestep` from the classes CSV (plus safe edge filtering). I also included a tiny prompt to relax baseline thresholds for smoke tests.
 
 ---
 
@@ -8,7 +5,6 @@ Below is (1) the **updated README** block with step-by-step “what to run” + 
 
 Replace your README’s quickstart/run instructions with this block.
 
-```markdown
 # Catching Illicit Crypto Flows — Elliptic GNN Project
 
 Implements the ISyE 6740 project: detecting illicit Bitcoin transactions on the Elliptic dataset using feature-only baselines (LR, XGBoost) and GNNs (GCN, GraphSAGE, GAT) with leakage-safe temporal splits, calibration, and operations-focused metrics.
@@ -16,8 +12,6 @@ Implements the ISyE 6740 project: detecting illicit Bitcoin transactions on the 
 ## Repo layout
 
 ```
-
-.
 ├── configs/
 │   ├── split.yaml
 │   ├── baseline_lr.yaml
@@ -39,8 +33,7 @@ Implements the ISyE 6740 project: detecting illicit Bitcoin transactions on the 
 ├── app/
 │   └── streamlit_app.py
 └── environment.yml
-
-````
+```
 
 ## 0) Requirements
 
@@ -202,185 +195,8 @@ Browse runs under `outputs/…`:
 4. Generate plots + Streamlit to review
 5. Then tune/sweeps (hidden_dim, dropout, class weighting / focal) and run paired bootstrap vs baselines.
 
-```
 
----
 
-# 🔧 Codex patch — robust dataset loader (features/timestep/edgelist)
-
-Paste this to Codex. It fixes the common pitfalls:
-
-- **timestep** is read from `elliptic_txs_classes.csv` (`time_step` → `timestep`), not from the features CSV.
-- **txId/src/dst** are forced to integers.
-- **edgelist** header or no-header handled cleanly.
-- **intra-timestep** edge enforcement (no leakage).
-- Helpful `[EDGES] …` print.
-
-```
-
-Open the repo and patch the dataset loader to robustly parse Elliptic.
-
-FILE: src/data/dataset_elliptic.py
-
-GOAL
-
-* Features CSV: txId + 166 feature columns (no timestep).
-* Classes CSV: txId + class + time_step → normalize to 'timestep' and map labels.
-* Edgelist CSV: handle header/no-header, force int ids, map to node indices.
-* Enforce intra-timestep edges; print counts.
-
-EDITS (replace the current load_elliptic_as_graph implementation with this one):
-
-import os
-import json
-import pandas as pd
-import numpy as np
-import torch
-from torch_geometric.data import Data
-from typing import Dict, Tuple
-import warnings
-
-LABEL_MAPS = {
-"class1": 1, "1": 1, 1: 1, "illicit": 1,
-"class2": 0, "2": 0, 2: 0, "licit": 0,
-"unknown": -1, -1: -1
-}
-
-def _map_label(v):
-s = str(v).strip().lower()
-return LABEL_MAPS.get(s, LABEL_MAPS.get(v, -1))
-
-def load_elliptic_as_graph(
-data_dir: str,
-features_csv: str = "elliptic_txs_features.csv",
-classes_csv: str = "elliptic_txs_classes.csv",
-edgelist_csv: str = "elliptic_txs_edgelist.csv",
-) -> Tuple[Data, Dict]:
-"""
-Returns a single graph:
-data.x: [N, F], data.y: [N] (0/1/-1), data.edge_index: [2, E]
-data.timestep: [N] in 1..49
-"""
-
-```
-f_path = os.path.join(data_dir, features_csv)
-c_path = os.path.join(data_dir, classes_csv)
-e_path = os.path.join(data_dir, edgelist_csv)
-
-# --- FEATURES: txId + 166 features (no timestep here)
-df_feat = pd.read_csv(f_path, header=None)
-if df_feat.shape[1] < 2:
-    raise ValueError("features CSV appears malformed.")
-# Expect 1 + 166 = 167 columns most commonly
-feat_cols = [f"f{i}" for i in range(df_feat.shape[1] - 1)]
-df_feat.columns = ["txId"] + feat_cols
-df_feat["txId"] = pd.to_numeric(df_feat["txId"], errors="raise").astype(np.int64)
-
-# --- CLASSES: txId + class + time_step (normalize names)
-df_cls = pd.read_csv(c_path)
-df_cls.columns = [c.strip() for c in df_cls.columns]
-
-# normalize columns
-if "txId" not in df_cls.columns:
-    for col in df_cls.columns:
-        if col.lower().startswith("tx"):
-            df_cls = df_cls.rename(columns={col: "txId"})
-            break
-if "time_step" in df_cls.columns:
-    df_cls = df_cls.rename(columns={"time_step": "timestep"})
-if "timestep" not in df_cls.columns:
-    for col in df_cls.columns:
-        if col.lower().startswith("time"):
-            df_cls = df_cls.rename(columns={col: "timestep"})
-            break
-if "class" not in df_cls.columns:
-    for col in df_cls.columns:
-        if col.lower().startswith("class"):
-            df_cls = df_cls.rename(columns={col: "class"})
-            break
-
-df_cls["txId"] = pd.to_numeric(df_cls["txId"], errors="raise").astype(np.int64)
-df_cls["timestep"] = pd.to_numeric(df_cls["timestep"], errors="raise").astype(np.int64)
-df_cls["label"] = df_cls["class"].apply(_map_label)
-df_cls = df_cls.drop(columns=["class"])
-
-# --- JOIN: ensure every feature row gets label + timestep (unknown if missing)
-df = df_feat.merge(df_cls[["txId","timestep","label"]], on="txId", how="left")
-if "label" not in df.columns:
-    df["label"] = -1
-df["label"] = df["label"].fillna(-1).astype(int)
-
-# build node index
-tx_ids = df["txId"].values.astype(np.int64)
-tx_to_idx = {int(tx): i for i, tx in enumerate(tx_ids)}
-
-# tensors
-x = torch.tensor(df[feat_cols].values, dtype=torch.float32)
-y = torch.tensor(df["label"].values, dtype=torch.int64)
-timestep = torch.tensor(df["timestep"].values, dtype=torch.int64)
-
-# --- EDGELIST: header/no-header robust, force ints
-try:
-    sniff = pd.read_csv(e_path, nrows=5)
-    if sniff.shape[1] >= 2 and not np.issubdtype(sniff.dtypes.iloc[0], np.number):
-        df_edge = pd.read_csv(e_path, header=0)
-    else:
-        df_edge = pd.read_csv(e_path, header=None)
-except Exception:
-    df_edge = pd.read_csv(e_path, header=None)
-
-df_edge = df_edge.iloc[:, :2].copy()
-df_edge.columns = ["src","dst"]
-df_edge["src"] = pd.to_numeric(df_edge["src"], errors="coerce").astype("Int64")
-df_edge["dst"] = pd.to_numeric(df_edge["dst"], errors="coerce").astype("Int64")
-df_edge = df_edge.dropna().astype({"src":"int64","dst":"int64"})
-edges_total = len(df_edge)
-
-# map to indices
-keep = df_edge["src"].isin(tx_to_idx) & df_edge["dst"].isin(tx_to_idx)
-kept = df_edge[keep]
-if kept.empty:
-    warnings.warn("No edges matched txId mapping. Check id dtypes/headers.")
-src_idx = np.array([tx_to_idx[int(s)] for s in kept["src"].values], dtype=np.int64)
-dst_idx = np.array([tx_to_idx[int(d)] for d in kept["dst"].values], dtype=np.int64)
-
-# enforce intra-timestep edges
-src_t = timestep[torch.from_numpy(src_idx)]
-dst_t = timestep[torch.from_numpy(dst_idx)]
-same_t = (src_t == dst_t).cpu().numpy()
-src_idx = src_idx[same_t]
-dst_idx = dst_idx[same_t]
-
-edge_index = torch.tensor([src_idx, dst_idx], dtype=torch.long)
-
-print(f"[EDGES] total_in_csv={edges_total} mapped={len(kept)} "
-      f"same_t={int(same_t.sum())} kept_in_graph={edge_index.size(1)}")
-
-data = Data(x=x, edge_index=edge_index, y=y)
-data.timestep = timestep
-
-meta = {
-    "num_nodes": int(x.size(0)),
-    "num_edges": int(edge_index.size(1)),
-    "num_features": int(x.size(1)),
-    "label_counts": {
-        "-1": int((y==-1).sum()),
-        "0": int((y==0).sum()),
-        "1": int((y==1).sum()),
-    }
-}
-return data, meta
-```
-
-````
-
-**Acceptance check:**
-
-```bash
-python -m src.data.build_graph --config configs/split.yaml
-# Expect: [EDGES] ... kept_in_graph > 0  and meta num_edges ≈ 234k
-python -m src.analysis.eda --processed_dir data/processed --assert_no_cross_time_edges
-````
 
 ---
 
