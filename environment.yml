@@ -17,6 +17,8 @@ dependencies:
   - xgboost
   - tensorboard
   - pip
+  - streamlit
+  - plotly
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu126   # CUDA 12.6 wheels
       - torch==2.7.0
