@@ -2,6 +2,7 @@
 import os, argparse, yaml, json, numpy as np, torch
 import torch.nn.functional as F
 from torch_geometric.loader import NeighborLoader
+from src.data.dataset_elliptic import make_temporal_masks
 from src.utils.common import ensure_dir, save_json, set_seed, log_device_info, gpu_available
 from src.utils.metrics import (
     pr_auc_illicit, roc_auc_illicit, precision_at_k, pick_threshold_max_f1,
@@ -44,11 +45,11 @@ def class_weight(train_y):
     w_neg = (pos + neg) / (2.0 * neg)
     return torch.tensor([w_neg, w_pos], dtype=torch.float32)
 
-def train_epoch(model, data, optimizer, loss_fn, scaler, use_amp, cfg):
+def train_epoch(model, data, edge_index, optimizer, loss_fn, scaler, use_amp, cfg):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     with torch.cuda.amp.autocast(enabled=use_amp):
-        logits = model(data.x, data.edge_index)
+        logits = model(data.x, edge_index)
         loss = loss_fn(logits[data.train_mask], data.y[data.train_mask])
     scaler.scale(loss).backward()
     if cfg.get("grad_clip", 0) and cfg["grad_clip"] > 0:
@@ -85,12 +86,13 @@ def train_epoch_minibatch(model, loader, optimizer, loss_fn, scaler, use_amp, cf
     return float(total_loss / total_examples)
 
 @torch.no_grad()
-def eval_split(model, data, mask):
+def eval_split(model, data, edge_index, mask):
     model.eval()
-    logits = model(data.x, data.edge_index)
+    logits = model(data.x, edge_index)
     probs = torch.softmax(logits, dim=1)[:,1].detach().cpu().numpy()
     y = data.y.detach().cpu().numpy()
-    return y[mask.cpu().numpy()], probs[mask.cpu().numpy()], logits
+    mask_np = mask.detach().cpu().numpy()
+    return y[mask_np], probs[mask_np], logits
 
 @torch.no_grad()
 def eval_val_minibatch(model, loader, device):
@@ -126,6 +128,31 @@ def main(cfg):
     if not hasattr(data, "train_mask"):
         raise RuntimeError("Build graph first: python -m src.data.build_graph --config configs/split.yaml")
 
+    window_k = cfg.get("train_window_k")
+    if window_k is not None:
+        window_k = int(window_k)
+        train_ts = data.timestep[data.train_mask]
+        if train_ts.numel() == 0:
+            raise RuntimeError("Train mask is empty; cannot apply rolling window.")
+        t_train_end = int(train_ts.max().item())
+        val_ts = data.timestep[data.val_mask]
+        if val_ts.numel() == 0:
+            raise RuntimeError("Validation mask is empty; cannot infer t_val_end.")
+        t_val_end = int(val_ts.max().item())
+        data = make_temporal_masks(data, t_train_end, t_val_end, window_k)
+
+    if cfg.get("use_time_scalar", False):
+        tnorm = (data.timestep.float() / float(data.timestep.max())).unsqueeze(1)
+        data.x = torch.cat([data.x, tnorm], dim=1)
+
+    edge_index_used = data.edge_index
+    if cfg.get("symmetrize_edges", False):
+        ei = torch.cat([edge_index_used, edge_index_used.flip(0)], dim=1)
+        edge_index_used = ei
+        data.edge_index = edge_index_used
+    else:
+        edge_index_used = data.edge_index
+
     use_mini_batch = bool(cfg.get("mini_batch", False))
 
     if use_mini_batch:
@@ -151,6 +178,7 @@ def main(cfg):
         data = data.to(device)
         train_loader = None
         val_loader = None
+        edge_index_used = data.edge_index
 
     in_dim = data.x.size(1)
     model = build_model(cfg["arch"], in_dim, cfg).to(device)
@@ -182,8 +210,8 @@ def main(cfg):
             loss = train_epoch_minibatch(model, train_loader, opt, loss_fn, scaler, use_amp, cfg, device)
             y_val, p_val = eval_val_minibatch(model, val_loader, device)
         else:
-            loss = train_epoch(model, data, opt, loss_fn, scaler, use_amp, cfg)
-            y_val, p_val, _ = eval_split(model, data, data.val_mask)
+            loss = train_epoch(model, data, edge_index_used, opt, loss_fn, scaler, use_amp, cfg)
+            y_val, p_val, _ = eval_split(model, data, edge_index_used, data.val_mask)
         if y_val.size == 0:
             pr_val = 0.0
         else:
@@ -211,16 +239,17 @@ def main(cfg):
 
     if use_mini_batch:
         data = data.to(device)
+        edge_index_used = data.edge_index
 
     # Optionally temperature-scale on validation logits
     if cfg.get("calibrate_temperature", True):
-        y_val, _, logits_val = eval_split(model, data, data.val_mask)
+        y_val, _, logits_val = eval_split(model, data, edge_index_used, data.val_mask)
         ts = TemperatureScaler().to(device)
         _ = ts.fit(logits_val[data.val_mask].to(device), data.y[data.val_mask])
         def predict_probs():
             model.eval()
             with torch.no_grad():
-                logits = model(data.x, data.edge_index)
+                logits = model(data.x, edge_index_used)
                 logits = logits / ts.T
                 probs = torch.softmax(logits, dim=1)[:,1]
             return probs.detach().cpu().numpy(), logits
@@ -229,7 +258,7 @@ def main(cfg):
         def predict_probs():
             model.eval()
             with torch.no_grad():
-                logits = model(data.x, data.edge_index)
+                logits = model(data.x, edge_index_used)
                 probs = torch.softmax(logits, dim=1)[:,1]
             return probs.detach().cpu().numpy(), logits
         get_probs = predict_probs
@@ -239,9 +268,21 @@ def main(cfg):
     y_np = data.y.detach().cpu().numpy()
     val_mask = data.val_mask.detach().cpu().numpy()
     test_mask = data.test_mask.detach().cpu().numpy()
+    timestep_np = data.timestep.detach().cpu().numpy()
 
     y_val, p_val = y_np[val_mask], probs[val_mask]
     y_te, p_te = y_np[test_mask], probs[test_mask]
+
+    val_indices = np.where(val_mask)[0]
+    test_indices = np.where(test_mask)[0]
+    np.save(os.path.join(outdir, "scores_val.npy"), p_val)
+    np.save(os.path.join(outdir, "y_val.npy"), y_val)
+    np.save(os.path.join(outdir, "node_idx_val.npy"), val_indices)
+    np.save(os.path.join(outdir, "timestep_val.npy"), timestep_np[val_mask])
+    np.save(os.path.join(outdir, "scores_test.npy"), p_te)
+    np.save(os.path.join(outdir, "y_test.npy"), y_te)
+    np.save(os.path.join(outdir, "node_idx_test.npy"), test_indices)
+    np.save(os.path.join(outdir, "timestep_test.npy"), timestep_np[test_mask])
 
     # Threshold selection on val
     if cfg.get("use_val_for_thresholds", True):

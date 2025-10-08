@@ -39,10 +39,10 @@ def load_cached(processed_dir):
 def get_split_arrays(data):
     x = data.x.numpy()
     y = data.y.numpy()
-    labeled = y >= 0
-    feats = x[labeled]
-    labels = y[labeled]
-    t = data.timestep.numpy()[labeled]
+    labeled_idx = np.where(y >= 0)[0]
+    feats = x[labeled_idx]
+    labels = y[labeled_idx]
+    t = data.timestep.numpy()[labeled_idx]
 
     t_train_end = int(torch.max(data.timestep[data.train_mask]).item())
     t_val_end = int(torch.max(data.timestep[data.val_mask]).item())
@@ -50,7 +50,7 @@ def get_split_arrays(data):
     train = t <= t_train_end
     val = (t > t_train_end) & (t <= t_val_end)
     test = t > t_val_end
-    return feats, labels, train, val, test
+    return feats, labels, train, val, test, labeled_idx, t
 
 def main(cfg):
     set_seed(cfg.get("seed", 42))
@@ -58,7 +58,18 @@ def main(cfg):
     ensure_dir(outdir)
 
     data = load_cached(cfg["processed_dir"])
-    X, y, train_mask, val_mask, test_mask = get_split_arrays(data)
+    X, y, train_mask, val_mask, test_mask, labeled_idx, timesteps = get_split_arrays(data)
+
+    window_k = cfg.get("train_window_k")
+    if window_k is not None:
+        window_k = int(window_k)
+        train_timesteps = timesteps[train_mask]
+        if train_timesteps.size == 0:
+            raise RuntimeError("Train mask is empty; cannot apply rolling window.")
+        T = int(train_timesteps.max())
+        t_lo = max(1, T - window_k + 1)
+        in_window = (timesteps >= t_lo) & (timesteps <= T)
+        train_mask = train_mask & in_window
 
     Xtr, ytr = X[train_mask], y[train_mask]
     Xva, yva = X[val_mask], y[val_mask]
@@ -107,6 +118,15 @@ def main(cfg):
     calibrator, transform = make_calibrator(cfg.get("calibration", "none"), p_va, yva)
     p_va_cal = transform(p_va)
     p_te_cal = transform(p_te)
+
+    np.save(os.path.join(outdir, "scores_val.npy"), p_va_cal)
+    np.save(os.path.join(outdir, "y_val.npy"), yva)
+    np.save(os.path.join(outdir, "node_idx_val.npy"), labeled_idx[val_mask])
+    np.save(os.path.join(outdir, "timestep_val.npy"), timesteps[val_mask])
+    np.save(os.path.join(outdir, "scores_test.npy"), p_te_cal)
+    np.save(os.path.join(outdir, "y_test.npy"), yte)
+    np.save(os.path.join(outdir, "node_idx_test.npy"), labeled_idx[test_mask])
+    np.save(os.path.join(outdir, "timestep_test.npy"), timesteps[test_mask])
 
     # Threshold selection on validation
     if cfg.get("use_val_for_thresholds", True):
