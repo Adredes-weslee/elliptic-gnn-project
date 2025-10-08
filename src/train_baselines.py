@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import xgboost as xgb
 import yaml
+from joblib import dump as _joblib_dump
 from packaging import version as _pkg_version
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -42,7 +43,7 @@ def pick_xgb_params():
     if ver >= _pkg_version.parse("2.0.0"):
         params["tree_method"] = "hist"
         params["device"] = "cuda" if use_cuda else "cpu"
-        # Do NOT set predictor explicitly (avoids 'not used' warning; auto-selected)
+        # predictor left to auto
     else:
         params["tree_method"] = "gpu_hist" if use_cuda else "hist"
     return params
@@ -95,6 +96,24 @@ def get_split_arrays(data):
     return feats, labels, train, val, test, labeled_idx, t
 
 
+def predict_proba(m, X_):
+    """
+    Prefer scikit-learn style predict_proba (works for XGBClassifier with best_iteration),
+    fall back to decision_function -> sigmoid if needed.
+    """
+    if hasattr(m, "predict_proba"):
+        proba = m.predict_proba(X_)
+        if proba.ndim == 2 and proba.shape[1] >= 2:
+            return proba[:, 1]
+        if proba.ndim == 1:
+            return proba
+    if hasattr(m, "decision_function"):
+        from scipy.special import expit
+
+        return expit(m.decision_function(X_))
+    raise RuntimeError("Model lacks probability interface")
+
+
 def main(cfg):
     set_seed(cfg.get("seed", 42))
     outdir = os.path.join("outputs", "baselines", cfg["run_name"])
@@ -120,7 +139,19 @@ def main(cfg):
     Xva, yva = X[val_mask], y[val_mask]
     Xte, yte = X[test_mask], y[test_mask]
 
+    # Class balance + optional auto scale_pos_weight for XGB
+    pos = int((ytr == 1).sum())
+    neg = int((ytr == 0).sum())
+    print(
+        f"[BAL] train positives={pos}, negatives={neg}, pos_rate={pos / (pos + neg + 1e-9):.4f}"
+    )
+    spw = cfg.get("scale_pos_weight", None)
+    if isinstance(spw, str) and spw.lower() == "auto":
+        spw = neg / max(1, pos)
+        print(f"[XGB] scale_pos_weight auto -> {spw:.3f}")
+
     model_name = cfg["model"]
+
     if model_name == "logistic_regression":
         model = Pipeline(
             [
@@ -137,55 +168,115 @@ def main(cfg):
                 ),
             ]
         )
+        model.fit(Xtr, ytr)
+
     elif model_name == "xgboost":
         xgb_params = pick_xgb_params()
+        if spw is not None:
+            xgb_params["scale_pos_weight"] = float(spw)
         print(f"[XGB] params={xgb_params}")
+
         model = XGBClassifier(
-            n_estimators=cfg.get("n_estimators", 600),
-            max_depth=cfg.get("max_depth", 6),
+            n_estimators=cfg.get("n_estimators", 1000),
+            max_depth=cfg.get("max_depth", 4),
             learning_rate=cfg.get("learning_rate", 0.05),
+            min_child_weight=cfg.get("min_child_weight", 5),
             subsample=cfg.get("subsample", 0.8),
             colsample_bytree=cfg.get("colsample_bytree", 0.8),
             eval_metric=cfg.get("eval_metric", "logloss"),
-            scale_pos_weight=cfg.get("scale_pos_weight", 1.0),
             **xgb_params,
         )
+
+        early_rounds = int(cfg.get("early_stopping_rounds", 0) or 0)
+        if early_rounds > 0:
+            fit_sig = inspect.signature(model.fit)
+            supports_es = "early_stopping_rounds" in fit_sig.parameters
+            supports_cb = "callbacks" in fit_sig.parameters
+
+            if supports_es:
+                model.fit(
+                    Xtr,
+                    ytr,
+                    eval_set=[(Xtr, ytr), (Xva, yva)],
+                    verbose=False,
+                    early_stopping_rounds=early_rounds,
+                )
+            elif supports_cb and hasattr(xgb, "callback"):
+                maximize = str(cfg.get("eval_metric", "logloss")).lower() in {
+                    "auc",
+                    "aucpr",
+                    "map",
+                    "ndcg",
+                }
+                callbacks = [
+                    xgb.callback.EarlyStopping(
+                        rounds=early_rounds, save_best=True, maximize=maximize
+                    )
+                ]
+                model.fit(
+                    Xtr,
+                    ytr,
+                    eval_set=[(Xtr, ytr), (Xva, yva)],
+                    verbose=False,
+                    callbacks=callbacks,
+                )
+            else:
+                print(
+                    "[XGB] early stopping not supported by this build; training without early stopping."
+                )
+                model.fit(
+                    Xtr,
+                    ytr,
+                    eval_set=[(Xtr, ytr), (Xva, yva)],
+                    verbose=False,
+                )
+            # Helpful prints if available
+            best_it = getattr(model, "best_iteration_", None)
+            if best_it is None:
+                best_it = getattr(model, "best_iteration", None)
+            best_score = getattr(model, "best_score_", None)
+            if best_score is None:
+                best_score = getattr(model, "best_score", None)
+            if best_it is not None:
+                print(
+                    f"[XGB] best_iteration={best_it}, best_score={best_score if best_score is not None else 'n/a'}"
+                )
+        else:
+            model.fit(Xtr, ytr)
     else:
         raise ValueError(f"Unknown baseline model: {model_name}")
 
-    model.fit(Xtr, ytr)
+    # Persist the trained model for later explanations/inspection
+    model_path = os.path.join(outdir, "model.pkl")
+    try:
+        _joblib_dump(model, model_path)
+        print(f"[SAVE] baseline model -> {model_path}")
+    except Exception as e:
+        print(f"[WARN] failed to save model to {model_path}: {e}")
 
-    def predict_proba(m, X_):
-        if isinstance(m, XGBClassifier):
-            booster = m.get_booster()
-            dm = xgb.DMatrix(X_)
-            return booster.predict(dm)
-        if hasattr(m, "predict_proba"):
-            return m.predict_proba(X_)[:, 1]
-        if hasattr(m, "decision_function"):
-            from scipy.special import expit
-
-            return expit(m.decision_function(X_))
-        raise RuntimeError("Model lacks probability interface")
-
+    # Probabilities
     p_tr = predict_proba(model, Xtr)
     p_va = predict_proba(model, Xva)
     p_te = predict_proba(model, Xte)
 
+    # Calibration (optional)
     print(f"[CAL] calibration={cfg.get('calibration', 'none')}")
     _, transform = make_calibrator(cfg.get("calibration", "none"), p_va, yva)
     p_va_cal = transform(p_va)
     p_te_cal = transform(p_te)
 
+    # Save per-node arrays (needed for analysis scripts & bootstrap)
     np.save(os.path.join(outdir, "scores_val.npy"), p_va_cal)
     np.save(os.path.join(outdir, "y_val.npy"), yva)
     np.save(os.path.join(outdir, "node_idx_val.npy"), labeled_idx[val_mask])
     np.save(os.path.join(outdir, "timestep_val.npy"), timesteps[val_mask])
+
     np.save(os.path.join(outdir, "scores_test.npy"), p_te_cal)
     np.save(os.path.join(outdir, "y_test.npy"), yte)
     np.save(os.path.join(outdir, "node_idx_test.npy"), labeled_idx[test_mask])
     np.save(os.path.join(outdir, "timestep_test.npy"), timesteps[test_mask])
 
+    # Threshold selection on validation (unless explicitly told to use test)
     if cfg.get("use_val_for_thresholds", True):
         if cfg.get("precision_target", 0.0) and cfg["precision_target"] > 0:
             thr = pick_threshold_for_precision(yva, p_va_cal, cfg["precision_target"])
@@ -194,6 +285,7 @@ def main(cfg):
     else:
         thr, _ = pick_threshold_max_f1(yte, p_te_cal)
 
+    # Metrics on test
     pr = pr_auc_illicit(yte, p_te_cal)
     roc = roc_auc_illicit(yte, p_te_cal)
     f1 = f1_at_threshold(yte, p_te_cal, thr)
