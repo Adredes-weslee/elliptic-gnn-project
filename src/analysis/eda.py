@@ -31,6 +31,19 @@ def load_processed_graph(processed_dir: Path) -> Tuple[torch.Tensor, torch.Tenso
     with open(meta_path, "r") as f:
         meta = json.load(f)
 
+    y_size = int(data.y.numel()) if hasattr(data, "y") else None
+    loaded_num_nodes = int(data.num_nodes) if hasattr(data, "num_nodes") else y_size
+    if (
+        "num_nodes" in meta
+        and loaded_num_nodes is not None
+        and int(meta["num_nodes"]) != int(loaded_num_nodes)
+    ):
+        size_display = y_size if y_size is not None else loaded_num_nodes
+        print(
+            f"[WARN] meta.num_nodes={meta.get('num_nodes')} differs from loaded tensors (y size={size_display})."
+        )
+    # (we'll compare edges later after we compute degs)
+
     if not hasattr(data, "edge_index"):
         raise AttributeError("Loaded data object has no 'edge_index' attribute")
     if not hasattr(data, "y"):
@@ -118,6 +131,20 @@ def main(processed_dir: Path, check_cross_time: bool) -> None:
     edge_index, y, timestep, meta = load_processed_graph(processed_dir)
     num_nodes = int(meta.get("num_nodes", y.size(0)))
     num_edges = int(meta.get("num_edges", edge_index.size(1)))
+
+    if num_edges == 0:
+        print(
+            "[INFO] edge_index has 0 edges. This can happen if you built the graph with a partial "
+            "features CSV (only a few txIds) or if edgelist txIds didn't map. "
+            "Use the full elliptic_txs_features.csv to see ~234k edges."
+        )
+    # sanity: compare edge count to edge_index
+    calc_edges = int(edge_index.size(1))
+    if calc_edges != num_edges:
+        print(
+            f"[WARN] meta.num_edges={num_edges} but edge_index has {calc_edges}. Using edge_index count for analysis."
+        )
+        num_edges = calc_edges
 
     if check_cross_time:
         assert_no_cross_time_edges(edge_index, timestep)
