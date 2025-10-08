@@ -13,6 +13,7 @@ dependencies:
   - scikit-learn
   - scipy
   - matplotlib
+  - shap
   - pytest
   - pyyaml
   - tqdm

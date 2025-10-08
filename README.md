@@ -108,6 +108,21 @@ python src/analysis/calibration_plots.py --run_dir outputs/gnn/<run_name>
 python src/analysis/workload_curves.py --run_dir outputs/gnn/<run_name> --k_max 5000
 ```
 
+## Interpretability
+
+Explainability examples for the baseline XGBoost model and trained GNNs.
+
+```bash
+# SHAP summary for an XGBoost baseline run (re-uses the saved model if available)
+python -m src.analysis.explain xgb --run_dir outputs/baselines/xgb_default --max_plots 10
+
+# GNNExplainer visualization for a specific node
+python -m src.analysis.explain gnn --run_dir outputs/gnn/<run_name> --node 12345
+
+# Let the script auto-pick a high-confidence true/false positive for explanation
+python -m src.analysis.explain gnn --run_dir outputs/gnn/<run_name>
+```
+
 ## 5) Repo layout
 
 ```
