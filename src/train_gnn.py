@@ -242,29 +242,24 @@ def main(cfg):
         edge_index_used = data.edge_index
 
     # Optionally temperature-scale on validation logits
-    if cfg.get("calibrate_temperature", True):
-        y_val, _, logits_val = eval_split(model, data, edge_index_used, data.val_mask)
+    ts = None
+    use_temp_scale = bool(cfg.get("calibrate_temperature", True))
+    if use_temp_scale:
+        _, _, logits_val = eval_split(model, data, edge_index_used, data.val_mask)
         ts = TemperatureScaler().to(device)
         _ = ts.fit(logits_val[data.val_mask].to(device), data.y[data.val_mask])
-        def predict_probs():
-            model.eval()
-            with torch.no_grad():
-                logits = model(data.x, edge_index_used)
+
+    def get_probs(edge_index_eval):
+        model.eval()
+        with torch.no_grad():
+            logits = model(data.x, edge_index_eval)
+            if use_temp_scale and ts is not None:
                 logits = logits / ts.T
-                probs = torch.softmax(logits, dim=1)[:,1]
-            return probs.detach().cpu().numpy(), logits
-        get_probs = predict_probs
-    else:
-        def predict_probs():
-            model.eval()
-            with torch.no_grad():
-                logits = model(data.x, edge_index_used)
-                probs = torch.softmax(logits, dim=1)[:,1]
-            return probs.detach().cpu().numpy(), logits
-        get_probs = predict_probs
+            probs = torch.softmax(logits, dim=1)[:, 1]
+        return probs.detach().cpu().numpy(), logits
 
     # Final eval
-    probs, logits = get_probs()
+    probs, logits = get_probs(edge_index_used)
     y_np = data.y.detach().cpu().numpy()
     val_mask = data.val_mask.detach().cpu().numpy()
     test_mask = data.test_mask.detach().cpu().numpy()
@@ -317,6 +312,43 @@ def main(cfg):
     ensure_dir(outdir)
     torch.save(model.state_dict(), os.path.join(outdir, "best.ckpt"))
     save_json(os.path.join(outdir, "metrics.json"), metrics)
+    frac = float(cfg.get("ablate_hubs_frac", 0.0))
+    if frac > 0:
+        num_nodes = data.num_nodes
+        num_hubs = int(frac * float(num_nodes))
+        edge_index_cpu = edge_index_used.detach().cpu()
+        deg_src = torch.bincount(edge_index_cpu[0], minlength=num_nodes)
+        deg_dst = torch.bincount(edge_index_cpu[1], minlength=num_nodes)
+        deg = deg_src + deg_dst
+        hubs = torch.zeros(num_nodes, dtype=torch.bool)
+        if num_hubs > 0:
+            topk = torch.topk(deg, num_hubs)
+            hubs[topk.indices] = True
+        edge_mask = ~(hubs[edge_index_cpu[0]] | hubs[edge_index_cpu[1]])
+        edge_index_abl = edge_index_cpu[:, edge_mask].to(edge_index_used.device)
+        probs_abl, _ = get_probs(edge_index_abl)
+        p_te_abl = probs_abl[test_mask]
+        y_bin = (y_te == 1).astype(int)
+        pr_abl = pr_auc_illicit(y_bin, p_te_abl)
+        roc_abl = roc_auc_illicit(y_bin, p_te_abl)
+        f1_abl = f1_at_threshold(y_bin, p_te_abl, thr)
+        p_at_k_abl = precision_at_k(y_bin, p_te_abl, cfg.get("topk", 100))
+        rec_at_p_abl = recall_at_precision(y_bin, p_te_abl, cfg.get("precision_target", 0.90))
+        ece_abl = expected_calibration_error(y_bin, p_te_abl)
+        metrics_hub_removed = dict(
+            pr_auc_illicit=pr_abl,
+            roc_auc=roc_abl,
+            f1_illicit_at_thr=f1_abl,
+            threshold=thr,
+            precision_at_k=p_at_k_abl,
+            recall_at_precision=rec_at_p_abl,
+            ece=ece_abl,
+            n_test=int(len(y_te)),
+            n_hubs=int(num_hubs),
+            hub_fraction=frac,
+            n_edges_remaining=int(edge_index_abl.size(1)),
+        )
+        save_json(os.path.join(outdir, "metrics_hub_removed.json"), metrics_hub_removed)
     with open(os.path.join(outdir, "config_used.yaml"), "w") as f:
         yaml.safe_dump(cfg, f)
     logger.close()

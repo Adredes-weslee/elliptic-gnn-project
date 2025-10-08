@@ -26,6 +26,7 @@ precision_target: 0.90
 topk: 100
 
 calibrate_temperature: true
+ablate_hubs_frac: 0.0
 symmetrize_edges: false
 use_time_scalar: false
 train_window_k: null   # e.g., 6 trains on last 6 steps of train period
