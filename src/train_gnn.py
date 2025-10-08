@@ -1,7 +1,7 @@
 
 import os, argparse, yaml, json, numpy as np, torch
 import torch.nn.functional as F
-from src.utils.common import ensure_dir, save_json, set_seed
+from src.utils.common import ensure_dir, save_json, set_seed, log_device_info, gpu_available
 from src.utils.metrics import (
     pr_auc_illicit, roc_auc_illicit, precision_at_k, pick_threshold_max_f1,
     pick_threshold_for_precision, f1_at_threshold, expected_calibration_error, recall_at_precision
@@ -23,8 +23,14 @@ def build_model(arch, in_dim, cfg):
     else:
         raise ValueError("Unknown arch")
 
-def get_device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def get_device(cfg):
+    import torch
+    forced = cfg.get("device","auto")
+    if forced == "cuda" and gpu_available():
+        return torch.device("cuda")
+    if forced == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if gpu_available() else "cpu")
 
 def class_weight(train_y):
     pos = (train_y == 1).sum().item()
@@ -36,13 +42,20 @@ def class_weight(train_y):
     w_neg = (pos + neg) / (2.0 * neg)
     return torch.tensor([w_neg, w_pos], dtype=torch.float32)
 
-def train_epoch(model, data, optimizer, loss_fn):
+def train_epoch(model, data, optimizer, loss_fn, scaler, use_amp, cfg):
     model.train()
-    optimizer.zero_grad()
-    logits = model(data.x, data.edge_index)
-    loss = loss_fn(logits[data.train_mask], data.y[data.train_mask])
-    loss.backward()
-    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        logits = model(data.x, data.edge_index)
+        loss = loss_fn(logits[data.train_mask], data.y[data.train_mask])
+    scaler.scale(loss).backward()
+    if cfg.get("grad_clip", 0) and cfg["grad_clip"] > 0:
+        scaler.unscale_(optimizer)
+        import torch as _torch
+        _torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
     return float(loss.item())
 
 @torch.no_grad()
@@ -58,8 +71,11 @@ def main(cfg):
     outdir = os.path.join("outputs", "gnn", cfg["run_name"])
     ensure_dir(outdir)
 
-    device = get_device()
-    print(f"Using device: {device}")
+    device = get_device(cfg)
+    log_device_info()
+    print(f"[RUN] Using device: {device}")
+    use_amp = (device.type == "cuda") and bool(cfg.get("amp", True))
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     data = load_cached(cfg["processed_dir"]).to(device)
     if not hasattr(data, "train_mask"):
@@ -91,7 +107,7 @@ def main(cfg):
     bad = 0
 
     for epoch in range(1, cfg["max_epochs"]+1):
-        loss = train_epoch(model, data, opt, loss_fn)
+        loss = train_epoch(model, data, opt, loss_fn, scaler, use_amp, cfg)
 
         # evaluate PR-AUC on val (illicit)
         y_val, p_val, _ = eval_split(model, data, data.val_mask)

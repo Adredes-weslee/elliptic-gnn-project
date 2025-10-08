@@ -63,6 +63,13 @@ python -m src.train_gnn --config configs/sage.yaml
 python -m src.train_gnn --config configs/gat.yaml
 ```
 
+On a CUDA machine you should see startup logs similar to:
+
+```
+[GPU] CUDA available: 1 device(s) -> ['NVIDIA ...'], torch.version.cuda=...
+[RUN] Using device: cuda
+```
+
 Artifacts: `outputs/gnn/<run_name>/metrics.json` and `best.ckpt`.
 
 ## 5) Repo layout
