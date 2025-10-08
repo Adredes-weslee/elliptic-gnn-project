@@ -1,6 +1,7 @@
 
 import os, argparse, yaml, json, numpy as np, torch
 import torch.nn.functional as F
+from torch_geometric.loader import NeighborLoader
 from src.utils.common import ensure_dir, save_json, set_seed, log_device_info, gpu_available
 from src.utils.metrics import (
     pr_auc_illicit, roc_auc_illicit, precision_at_k, pick_threshold_max_f1,
@@ -59,6 +60,30 @@ def train_epoch(model, data, optimizer, loss_fn, scaler, use_amp, cfg):
     optimizer.zero_grad(set_to_none=True)
     return float(loss.item())
 
+def train_epoch_minibatch(model, loader, optimizer, loss_fn, scaler, use_amp, cfg, device):
+    model.train()
+    total_loss = 0.0
+    total_examples = 0
+    for batch in loader:
+        batch = batch.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logits = model(batch.x, batch.edge_index)
+            target = batch.y[: batch.batch_size]
+            loss = loss_fn(logits[: batch.batch_size], target)
+        scaler.scale(loss).backward()
+        if cfg.get("grad_clip", 0) and cfg["grad_clip"] > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        total_loss += loss.item() * int(batch.batch_size)
+        total_examples += int(batch.batch_size)
+    if total_examples == 0:
+        return 0.0
+    return float(total_loss / total_examples)
+
 @torch.no_grad()
 def eval_split(model, data, mask):
     model.eval()
@@ -66,6 +91,24 @@ def eval_split(model, data, mask):
     probs = torch.softmax(logits, dim=1)[:,1].detach().cpu().numpy()
     y = data.y.detach().cpu().numpy()
     return y[mask.cpu().numpy()], probs[mask.cpu().numpy()], logits
+
+@torch.no_grad()
+def eval_val_minibatch(model, loader, device):
+    model.eval()
+    y_batches = []
+    p_batches = []
+    for batch in loader:
+        batch = batch.to(device)
+        logits = model(batch.x, batch.edge_index)
+        logits = logits[: batch.batch_size]
+        probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu()
+        y_batches.append(batch.y[: batch.batch_size].detach().cpu())
+        p_batches.append(probs)
+    if not y_batches:
+        return np.array([]), np.array([])
+    y = torch.cat(y_batches).numpy()
+    probs = torch.cat(p_batches).numpy()
+    return y, probs
 
 def main(cfg):
     set_seed(cfg.get("seed", 42))
@@ -79,9 +122,35 @@ def main(cfg):
     use_amp = (device.type == "cuda") and bool(cfg.get("amp", True))
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    data = load_cached(cfg["processed_dir"]).to(device)
+    data = load_cached(cfg["processed_dir"])
     if not hasattr(data, "train_mask"):
         raise RuntimeError("Build graph first: python -m src.data.build_graph --config configs/split.yaml")
+
+    use_mini_batch = bool(cfg.get("mini_batch", False))
+
+    if use_mini_batch:
+        train_idx = torch.where(data.train_mask)[0]
+        val_idx = torch.where(data.val_mask)[0]
+        fanout = cfg.get("fanout", [10, 10])
+        batch_size = cfg.get("batch_size", 8192)
+        train_loader = NeighborLoader(
+            data,
+            num_neighbors=fanout,
+            batch_size=batch_size,
+            input_nodes=train_idx,
+            shuffle=True,
+        )
+        val_loader = NeighborLoader(
+            data,
+            num_neighbors=fanout,
+            batch_size=batch_size,
+            input_nodes=val_idx,
+            shuffle=False,
+        )
+    else:
+        data = data.to(device)
+        train_loader = None
+        val_loader = None
 
     in_dim = data.x.size(1)
     model = build_model(cfg["arch"], in_dim, cfg).to(device)
@@ -109,11 +178,16 @@ def main(cfg):
     bad = 0
 
     for epoch in range(1, cfg["max_epochs"]+1):
-        loss = train_epoch(model, data, opt, loss_fn, scaler, use_amp, cfg)
-
-        # evaluate PR-AUC on val (illicit)
-        y_val, p_val, _ = eval_split(model, data, data.val_mask)
-        pr_val = pr_auc_illicit((y_val==1).astype(int), p_val)
+        if use_mini_batch:
+            loss = train_epoch_minibatch(model, train_loader, opt, loss_fn, scaler, use_amp, cfg, device)
+            y_val, p_val = eval_val_minibatch(model, val_loader, device)
+        else:
+            loss = train_epoch(model, data, opt, loss_fn, scaler, use_amp, cfg)
+            y_val, p_val, _ = eval_split(model, data, data.val_mask)
+        if y_val.size == 0:
+            pr_val = 0.0
+        else:
+            pr_val = pr_auc_illicit((y_val==1).astype(int), p_val)
 
         logger.log_epoch(epoch, loss, pr_val)
 
@@ -134,6 +208,9 @@ def main(cfg):
     # Load best
     if best_state is not None:
         model.load_state_dict({k:v.to(device) for k,v in best_state.items()})
+
+    if use_mini_batch:
+        data = data.to(device)
 
     # Optionally temperature-scale on validation logits
     if cfg.get("calibrate_temperature", True):
