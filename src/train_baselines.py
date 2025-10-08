@@ -10,7 +10,27 @@ from src.utils.metrics import (
     pr_auc_illicit, roc_auc_illicit, precision_at_k, pick_threshold_max_f1,
     pick_threshold_for_precision, f1_at_threshold, expected_calibration_error, recall_at_precision
 )
-from src.utils.calibrate import calibrate_isotonic, calibrate_platt
+
+
+def pick_tree_method():
+    try:
+        import torch
+        return "gpu_hist" if torch.cuda.is_available() else "hist"
+    except Exception:
+        return "hist"
+
+
+def make_calibrator(calibration: str, p_val, y_val):
+    from src.utils.calibrate import calibrate_isotonic, calibrate_platt
+
+    calibration = (calibration or "none").lower()
+    if calibration == "isotonic":
+        cal = calibrate_isotonic(p_val, y_val)
+        return cal, (lambda s: cal.transform(s))
+    if calibration == "platt":
+        cal = calibrate_platt(p_val, y_val)
+        return cal, (lambda s: cal.predict_proba(s.reshape(-1, 1))[:, 1])
+    return None, (lambda s: s)
 
 def load_cached(processed_dir):
     data = torch.load(os.path.join(processed_dir, "graph.pt"), map_location="cpu")
@@ -51,6 +71,10 @@ def main(cfg):
             ("clf", LogisticRegression(max_iter=cfg.get("max_iter",2000), C=cfg.get("C",1.0)))
         ])
     elif model_name == "xgboost":
+        method = cfg.get("tree_method", "auto")
+        if method == "auto":
+            method = pick_tree_method()
+        print(f"[XGB] tree_method={method}")
         model = XGBClassifier(
             n_estimators=cfg.get("n_estimators",600),
             max_depth=cfg.get("max_depth",6),
@@ -58,7 +82,7 @@ def main(cfg):
             subsample=cfg.get("subsample",0.8),
             colsample_bytree=cfg.get("colsample_bytree",0.8),
             eval_metric=cfg.get("eval_metric","logloss"),
-            tree_method=cfg.get("tree_method","auto")
+            tree_method=method
         )
     else:
         raise ValueError("Unknown baseline model")
@@ -79,19 +103,10 @@ def main(cfg):
     p_te = predict_proba(model, Xte)
 
     # Calibration (optional)
-    cal = cfg.get("calibration","none")
-    if cal == "isotonic":
-        calibrator = calibrate_isotonic(p_va, yva)
-        p_te_cal = calibrator.transform(p_te)
-        p_va_cal = calibrator.transform(p_va)
-    elif cal == "platt":
-        calibrator = calibrate_platt(p_va, yva)
-        p_te_cal = calibrator.predict_proba(p_te.reshape(-1,1))[:,1]
-        p_va_cal = calibrator.predict_proba(p_va.reshape(-1,1))[:,1]
-    else:
-        calibrator = None
-        p_te_cal = p_te
-        p_va_cal = p_va
+    print(f"[CAL] calibration={cfg.get('calibration','none')}")
+    calibrator, transform = make_calibrator(cfg.get("calibration", "none"), p_va, yva)
+    p_va_cal = transform(p_va)
+    p_te_cal = transform(p_te)
 
     # Threshold selection on validation
     if cfg.get("use_val_for_thresholds", True):
