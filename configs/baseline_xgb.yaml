@@ -1,19 +1,28 @@
-
 run_name: xgb_default
 seed: 42
 processed_dir: data/processed
 
 model: xgboost
-calibration: isotonic   # isotonic | platt | none
+calibration: isotonic      # isotonic | platt | none
 
 use_val_for_thresholds: true
-precision_target: 0.75
-topk: 100
+precision_target: 0.0      # use max-F1 on validation
+topk: 100                  # Precision@K on test
 
-n_estimators: 600
-max_depth: 6
+# core XGB
+n_estimators: 1000
+max_depth: 4
 learning_rate: 0.05
+min_child_weight: 5
 subsample: 0.8
 colsample_bytree: 0.8
-eval_metric: logloss
-tree_method: auto       # set 'gpu_hist' to force GPU
+eval_metric: aucpr
+
+# early stopping (handled via kwarg or callbacks, auto-detected)
+early_stopping_rounds: 50
+
+# handle imbalance
+scale_pos_weight: "auto"   # computed from train split
+
+# device: auto via code (CUDA if available)
+# tree_method: auto         # keep default; code chooses per version/device

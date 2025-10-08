@@ -1,14 +1,14 @@
-
 run_name: lr_default
 seed: 42
 processed_dir: data/processed
 
 model: logistic_regression
-calibration: isotonic   # isotonic | platt | none
+calibration: isotonic
 
 use_val_for_thresholds: true
-precision_target: 0.75  # if >0, choose threshold to hit this precision; else max-F1
-topk: 100               # Precision@K on test
+precision_target: 0.0      # use max-F1 on val
+topk: 100
 
 C: 1.0
 max_iter: 2000
+class_weight: balanced     # helpful on this class imbalance
