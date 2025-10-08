@@ -8,6 +8,7 @@ from src.utils.metrics import (
 )
 from src.utils.calibrate import TemperatureScaler
 from src.models.gnn import GCNNet, SAGENet, GATNet
+from src.utils.logger import RunLogger
 
 def load_cached(processed_dir):
     data = torch.load(os.path.join(processed_dir, "graph.pt"))
@@ -70,6 +71,7 @@ def main(cfg):
     set_seed(cfg.get("seed", 42))
     outdir = os.path.join("outputs", "gnn", cfg["run_name"])
     ensure_dir(outdir)
+    logger = RunLogger(outdir)
 
     device = get_device(cfg)
     log_device_info()
@@ -112,6 +114,8 @@ def main(cfg):
         # evaluate PR-AUC on val (illicit)
         y_val, p_val, _ = eval_split(model, data, data.val_mask)
         pr_val = pr_auc_illicit((y_val==1).astype(int), p_val)
+
+        logger.log_epoch(epoch, loss, pr_val)
 
         if pr_val > best_val:
             best_val = pr_val
@@ -197,6 +201,7 @@ def main(cfg):
     save_json(os.path.join(outdir, "metrics.json"), metrics)
     with open(os.path.join(outdir, "config_used.yaml"), "w") as f:
         yaml.safe_dump(cfg, f)
+    logger.close()
     print(json.dumps(metrics, indent=2))
 
 if __name__ == "__main__":
