@@ -10,7 +10,7 @@ import yaml
 from torch_geometric.loader import NeighborLoader
 
 from src.data.dataset_elliptic import make_temporal_masks
-from src.models.gnn import GATNet, GCNNet, SAGENet
+from src.models.gnn import GATNet, GCNNet, SAGENet, SAGEResBNNet
 from src.utils.calibrate import TemperatureScaler
 from src.utils.common import (
     ensure_dir,
@@ -33,20 +33,13 @@ from src.utils.metrics import (
 
 
 def _autocast_ctx(device, enabled: bool):
-    """
-    Unified autocast context: uses torch.amp in PyTorch 2.6+, otherwise falls back to torch.cuda.amp.
-    """
     if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
         return torch.amp.autocast(device_type=device.type, enabled=enabled)
     else:
-        # Back-compat; safe even if CPU (it will just ignore autocast)
         return torch.cuda.amp.autocast(enabled=enabled)
 
 
 def _make_grad_scaler(device, enabled: bool):
-    """
-    Unified GradScaler: uses torch.amp.GradScaler(device=...) in PyTorch 2.6+, otherwise torch.cuda.amp.GradScaler.
-    """
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         return torch.amp.GradScaler(device=device.type, enabled=enabled)
     else:
@@ -54,20 +47,17 @@ def _make_grad_scaler(device, enabled: bool):
 
 
 def load_cached(processed_dir):
-    """
-    Load processed graph.pt safely under PyTorch>=2.6 (weights_only default is True).
-    We explicitly set weights_only=False for this trusted local artifact.
-    """
+    # Safe load for PyTorch>=2.6 (weights_only default True)
     path = os.path.join(processed_dir, "graph.pt")
     sig = inspect.signature(torch.load)
     kwargs = {"map_location": "cpu"}
     if "weights_only" in sig.parameters:
-        kwargs["weights_only"] = False  # IMPORTANT for loading torch_geometric Data
+        kwargs["weights_only"] = False  # local trusted artifact
     try:
         data = torch.load(path, **kwargs)
     except Exception as e:
         raise RuntimeError(
-            f"Failed to load {path}. If this persists, ensure graph was created with torch.save(Data(...)). "
+            f"Failed to load {path}. Ensure graph was created with torch.save(Data(...)). "
             f"Original error: {e}"
         ) from e
     return data
@@ -96,6 +86,19 @@ def build_model(arch, in_dim, cfg):
             heads=cfg.get("heads", 4),
             dropout=cfg["dropout"],
         )
+    elif arch in ("sage_resbn", "sage_bn", "sage_res"):
+        return SAGEResBNNet(
+            in_dim,
+            hidden_dim=cfg.get("hidden_dim", 128),
+            layers=cfg.get("layers", 3),
+            dropout=cfg.get("dropout", 0.2),
+            num_classes=2,
+            use_bn=cfg.get("use_bn", True),
+            residual=cfg.get("residual", True),
+            time_embed_dim=cfg.get("time_embed_dim", 0),
+            time_embed_type=cfg.get("time_embed_type", "learned"),
+            max_timestep=cfg.get("max_timestep", 49),
+        )
     else:
         raise ValueError("Unknown arch")
 
@@ -114,20 +117,75 @@ def class_weight(train_y):
     neg = (train_y == 0).sum().item()
     if pos == 0 or neg == 0:
         return torch.tensor([1.0, 1.0], dtype=torch.float32)
-    # weights inversely proportional to frequency
     w_pos = (pos + neg) / (2.0 * pos)
     w_neg = (pos + neg) / (2.0 * neg)
     return torch.tensor([w_neg, w_pos], dtype=torch.float32)
 
 
+def _model_uses_time_embed(model):
+    return hasattr(model, "time_embed_dim") and getattr(model, "time_embed_dim") > 0
+
+
+# -------- NEW: time-aware loss weighting + optional embedding L2 --------
+def _norm_train_time(t_vec, t_min, t_max):
+    denom = max(float(t_max - t_min), 1.0)
+    return (t_vec.float() - float(t_min)) / denom
+
+
+def _make_loss_fn(cfg, cw, model, t_min, t_max):
+    """
+    Returns a callable: (logits, target, t_idx) -> scalar loss
+    - focal_loss supported (cfg.focal_loss)
+    - linear time weighting (cfg.time_loss_weighting == 'linear')
+    - optional L2 on learned time embedding (cfg.time_embed_l2)
+    """
+    use_linear_time = cfg.get("time_loss_weighting", "none") == "linear"
+    embed_l2 = float(cfg.get("time_embed_l2", 0.0))
+    use_focal = bool(cfg.get("focal_loss", False))
+    gamma = float(cfg.get("focal_gamma", 2.0))
+
+    def loss_fn(logits, target, t_idx=None):
+        # base per-sample loss (vector)
+        if use_focal:
+            ce = F.cross_entropy(logits, target, reduction="none")
+            pt = torch.softmax(logits, dim=1)[
+                torch.arange(len(target), device=logits.device), target
+            ]
+            loss_vec = ((1 - pt) ** gamma) * ce
+        else:
+            loss_vec = F.cross_entropy(
+                logits, target, weight=cw.to(logits.device), reduction="none"
+            )
+
+        # optional time reweight
+        if use_linear_time and t_idx is not None:
+            wt = _norm_train_time(t_idx, t_min, t_max).to(logits.device)
+            wt = torch.clamp(wt, min=1e-3)
+            loss_vec = loss_vec * wt
+
+        loss = loss_vec.mean()
+
+        # optional L2 on learned time embedding matrix
+        if embed_l2 > 0.0 and hasattr(model, "time_emb") and model.time_emb is not None:
+            loss = loss + embed_l2 * (model.time_emb.weight.pow(2).mean())
+
+        return loss
+
+    return loss_fn
+
+
+# ---------------- training loops ----------------
 def train_epoch(
     model, data, edge_index, optimizer, loss_fn, scaler, use_amp, cfg, device
 ):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     with _autocast_ctx(device, use_amp):
-        logits = model(data.x, edge_index)
-        loss = loss_fn(logits[data.train_mask], data.y[data.train_mask])
+        logits = model(
+            data.x, edge_index, data.timestep if _model_uses_time_embed(model) else None
+        )
+        t_idx = data.timestep[data.train_mask] if "time_loss_weighting" in cfg else None
+        loss = loss_fn(logits[data.train_mask], data.y[data.train_mask], t_idx)
     scaler.scale(loss).backward()
     if cfg.get("grad_clip", 0) and cfg["grad_clip"] > 0:
         scaler.unscale_(optimizer)
@@ -148,9 +206,18 @@ def train_epoch_minibatch(
         batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
         with _autocast_ctx(device, use_amp):
-            logits = model(batch.x, batch.edge_index)
+            logits = model(
+                batch.x,
+                batch.edge_index,
+                batch.timestep if _model_uses_time_embed(model) else None,
+            )
             target = batch.y[: batch.batch_size]
-            loss = loss_fn(logits[: batch.batch_size], target)
+            t_idx = (
+                batch.timestep[: batch.batch_size]
+                if "time_loss_weighting" in cfg
+                else None
+            )
+            loss = loss_fn(logits[: batch.batch_size], target, t_idx)
         scaler.scale(loss).backward()
         if cfg.get("grad_clip", 0) and cfg["grad_clip"] > 0:
             scaler.unscale_(optimizer)
@@ -168,7 +235,9 @@ def train_epoch_minibatch(
 @torch.no_grad()
 def eval_split(model, data, edge_index, mask):
     model.eval()
-    logits = model(data.x, edge_index)
+    logits = model(
+        data.x, edge_index, data.timestep if _model_uses_time_embed(model) else None
+    )
     probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
     y = data.y.detach().cpu().numpy()
     mask_np = mask.detach().cpu().numpy()
@@ -178,11 +247,14 @@ def eval_split(model, data, edge_index, mask):
 @torch.no_grad()
 def eval_val_minibatch(model, loader, device):
     model.eval()
-    y_batches = []
-    p_batches = []
+    y_batches, p_batches = [], []
     for batch in loader:
         batch = batch.to(device)
-        logits = model(batch.x, batch.edge_index)
+        logits = model(
+            batch.x,
+            batch.edge_index,
+            batch.timestep if _model_uses_time_embed(model) else None,
+        )
         logits = logits[: batch.batch_size]
         probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu()
         y_batches.append(batch.y[: batch.batch_size].detach().cpu())
@@ -203,7 +275,6 @@ def main(cfg):
     device = get_device(cfg)
     log_device_info()
     print(f"[RUN] Using device: {device}")
-
     use_amp = (device.type == "cuda") and bool(cfg.get("amp", True))
     scaler = _make_grad_scaler(device, use_amp)
 
@@ -227,12 +298,12 @@ def main(cfg):
         t_val_end = int(val_ts.max().item())
         data = make_temporal_masks(data, t_train_end, t_val_end, window_k)
 
-    # Optional time scalar feature
-    if cfg.get("use_time_scalar", False):
+    # Optional scalar time (kept for compatibility; disabled if embedding is on)
+    if cfg.get("use_time_scalar", False) and cfg.get("time_embed_dim", 0) == 0:
         tnorm = (data.timestep.float() / float(data.timestep.max())).unsqueeze(1)
         data.x = torch.cat([data.x, tnorm], dim=1)
 
-    # Edge handling
+    # Edges
     edge_index_used = data.edge_index
     if cfg.get("symmetrize_edges", False):
         ei = torch.cat([edge_index_used, edge_index_used.flip(0)], dim=1)
@@ -264,8 +335,7 @@ def main(cfg):
         )
     else:
         data = data.to(device)
-        train_loader = None
-        val_loader = None
+        train_loader, val_loader = None, None
         edge_index_used = data.edge_index
 
     # Model / Optimizer
@@ -275,29 +345,20 @@ def main(cfg):
         model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
     )
 
-    # Loss (optionally focal; otherwise weighted CE)
-    if cfg.get("focal_loss", False):
-        gamma = float(cfg.get("focal_gamma", 2.0))
-
-        def focal_loss(logits, target):
-            ce = F.cross_entropy(logits, target, reduction="none")
-            pt = torch.softmax(logits, dim=1)[torch.arange(len(target)), target]
-            loss = ((1 - pt) ** gamma) * ce
-            return loss.mean()
-
-        loss_fn = lambda logits, target: focal_loss(logits, target)
+    # Class weights (for CE path)
+    if cfg.get("class_weight_pos", "auto") == "auto":
+        cw = class_weight(data.y[data.train_mask])
     else:
-        if cfg.get("class_weight_pos", "auto") == "auto":
-            cw = class_weight(data.y[data.train_mask])
-        else:
-            cw = torch.tensor(
-                [1.0, float(cfg["class_weight_pos"])], dtype=torch.float32
-            )
-        loss_fn = lambda logits, target: F.cross_entropy(
-            logits, target, weight=cw.to(logits.device)
-        )
+        cw = torch.tensor([1.0, float(cfg["class_weight_pos"])], dtype=torch.float32)
 
-    # Train loop with early stopping on val PR-AUC
+    # Train-time timestep bounds for weighting
+    t_train = data.timestep[data.train_mask]
+    t_min, t_max = int(t_train.min().item()), int(t_train.max().item())
+
+    # Loss (focal/CE + optional time weighting + embed L2)
+    loss_fn = _make_loss_fn(cfg, cw, model, t_min, t_max)
+
+    # Train
     best_val = -1.0
     best_state = None
     patience = cfg.get("patience", 20)
@@ -318,7 +379,7 @@ def main(cfg):
         pr_val = (
             0.0 if y_val.size == 0 else pr_auc_illicit((y_val == 1).astype(int), p_val)
         )
-        logger.log_epoch(epoch, loss, pr_val)
+        RunLogger(outdir).log_epoch(epoch, loss, pr_val)  # quick log
 
         if pr_val > best_val:
             best_val = pr_val
@@ -338,7 +399,7 @@ def main(cfg):
             print("Early stopping.")
             break
 
-    # Load best weights
+    # Load best
     if best_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
@@ -346,7 +407,7 @@ def main(cfg):
         data = data.to(device)
         edge_index_used = data.edge_index
 
-    # Optional temperature scaling on validation logits
+    # Optional temperature scaling
     ts = None
     use_temp_scale = bool(cfg.get("calibrate_temperature", True))
     if use_temp_scale:
@@ -357,13 +418,17 @@ def main(cfg):
     def get_probs(edge_index_eval):
         model.eval()
         with torch.no_grad():
-            logits = model(data.x, edge_index_eval)
+            logits = model(
+                data.x,
+                edge_index_eval,
+                data.timestep if _model_uses_time_embed(model) else None,
+            )
             if use_temp_scale and ts is not None:
                 logits = logits / ts.T
             probs = torch.softmax(logits, dim=1)[:, 1]
         return probs.detach().cpu().numpy(), logits
 
-    # Final evaluation
+    # Final eval
     probs, logits = get_probs(edge_index_used)
     y_np = data.y.detach().cpu().numpy()
     val_mask = data.val_mask.detach().cpu().numpy()
@@ -416,11 +481,35 @@ def main(cfg):
         best_val_pr_auc=best_val,
     )
 
+    # -------- NEW: per-timestep PR-AUC on test --------
+    test_ts = timestep_np[test_mask]
+    if test_ts.size > 0:
+        # preserve chronological order
+        uniq = sorted(set(int(t) for t in test_ts.tolist()))
+        pr_by_t = []
+        for t in uniq:
+            idx = test_ts == t
+            if idx.sum() == 0:
+                pr_by_t.append(float("nan"))
+            else:
+                pr_by_t.append(pr_auc_illicit((y_te[idx] == 1).astype(int), p_te[idx]))
+
+        def _avg_tail(arr, k):
+            return float(sum(arr[-k:]) / k) if len(arr) >= k else None
+
+        metrics["test_pr_auc_by_time"] = pr_by_t
+        if pr_by_t:
+            metrics["pr_auc_last1"] = float(pr_by_t[-1])
+            if len(pr_by_t) >= 3:
+                metrics["pr_auc_last3"] = _avg_tail(pr_by_t, 3)
+            if len(pr_by_t) >= 5:
+                metrics["pr_auc_last5"] = _avg_tail(pr_by_t, 5)
+
     ensure_dir(outdir)
     torch.save(model.state_dict(), os.path.join(outdir, "best.ckpt"))
     save_json(os.path.join(outdir, "metrics.json"), metrics)
 
-    # Optional hub ablation evaluation
+    # Optional hub ablation (unchanged)
     frac = float(cfg.get("ablate_hubs_frac", 0.0))
     if frac > 0:
         num_nodes = data.num_nodes
@@ -438,22 +527,16 @@ def main(cfg):
         probs_abl, _ = get_probs(edge_index_abl)
         p_te_abl = probs_abl[test_mask]
         y_bin = (y_te == 1).astype(int)
-        pr_abl = pr_auc_illicit(y_bin, p_te_abl)
-        roc_abl = roc_auc_illicit(y_bin, p_te_abl)
-        f1_abl = f1_at_threshold(y_bin, p_te_abl, thr)
-        p_at_k_abl = precision_at_k(y_bin, p_te_abl, cfg.get("topk", 100))
-        rec_at_p_abl = recall_at_precision(
-            y_bin, p_te_abl, cfg.get("precision_target", 0.90)
-        )
-        ece_abl = expected_calibration_error(y_bin, p_te_abl)
         metrics_hub_removed = dict(
-            pr_auc_illicit=pr_abl,
-            roc_auc=roc_abl,
-            f1_illicit_at_thr=f1_abl,
+            pr_auc_illicit=pr_auc_illicit(y_bin, p_te_abl),
+            roc_auc=roc_auc_illicit(y_bin, p_te_abl),
+            f1_illicit_at_thr=f1_at_threshold(y_bin, p_te_abl, thr),
             threshold=thr,
-            precision_at_k=p_at_k_abl,
-            recall_at_precision=rec_at_p_abl,
-            ece=ece_abl,
+            precision_at_k=precision_at_k(y_bin, p_te_abl, cfg.get("topk", 100)),
+            recall_at_precision=recall_at_precision(
+                y_bin, p_te_abl, cfg.get("precision_target", 0.90)
+            ),
+            ece=expected_calibration_error(y_bin, p_te_abl),
             n_test=int(len(y_te)),
             n_hubs=int(num_hubs),
             hub_fraction=frac,
@@ -464,7 +547,7 @@ def main(cfg):
     with open(os.path.join(outdir, "config_used.yaml"), "w") as f:
         yaml.safe_dump(cfg, f)
 
-    logger.close()
+    RunLogger(outdir).close()
     print(json.dumps(metrics, indent=2))
 
 
