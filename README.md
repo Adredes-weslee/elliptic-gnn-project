@@ -1,55 +1,77 @@
 
-# Catching Illicit Crypto Flows — Elliptic GNN Project
+ Catching Illicit Crypto Flows — Elliptic GNN Project
 
-Implements the experiments described in the proposal **“Catching Illicit Crypto Flows: Temporal Graph Neural Networks on the Elliptic Bitcoin Dataset.”**
+Implements the ISyE 6740 project: detecting illicit Bitcoin transactions on the **Elliptic** dataset using **feature-only baselines** (LR, XGBoost) and **GNNs** (GCN, SAGE, GAT) with leakage-safe temporal splits, calibration, and operations-focused metrics.
 
-Includes:
-- Leakage-safe pipeline from Elliptic CSVs to a PyTorch Geometric graph with temporal masks
-- **Baselines:** Logistic Regression and XGBoost (with optional isotonic/Platt calibration)
-- **GNNs:** GCN, GraphSAGE, GAT with class-weighted loss and early stopping on **validation PR-AUC (illicit)**
-- Metrics: PR-AUC (illicit), ROC-AUC, F1 (illicit), Precision@K, Recall@Precision
-- Temperature scaling for GNN calibration
-- Reproducibility (seeded runs), YAML-configured experiments
+## Repo layout
 
-> **Dataset placement**: Put the 3 CSVs in `data/raw/`:
-> - `elliptic_txs_features.csv`
-> - `elliptic_txs_classes.csv`
-> - `elliptic_txs_edgelist.csv`
-
-## 1) Environment (conda)
-
-```bash
-conda env create -f environment.yml
-conda activate elliptic-gnn
 ```
 
-If `torch-geometric` wheels fail for your CUDA setup, see:
-https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html  
-For CPU-only, replace `pytorch-cuda=11.8` with `cpuonly` in `environment.yml`.
+.
+├── configs/
+│   ├── baseline_lr.yaml
+│   ├── baseline_xgb.yaml
+│   ├── gcn.yaml
+│   ├── sage.yaml
+│   ├── gat.yaml
+│   └── split.yaml
+├── data/
+│   └── raw/         # <- place the three Elliptic CSVs here
+├── outputs/         # run artifacts (created)
+├── src/
+│   ├── analysis/    # eval_by_time, calibration_plots, workload_curves, bootstrap_compare, hub_ablation, sweep, (robustness if added)
+│   ├── data/        # build_graph.py, dataset_elliptic.py
+│   ├── models/      # gnn.py
+│   ├── utils/       # common.py, metrics.py, calibrate.py, logger.py
+│   ├── train_baselines.py
+│   └── train_gnn.py
+├── environment.yml
+└── README.md
 
-## 2) Prepare data
+````
 
-Build the cached graph and masks (train/val/test by timestep):
+## 0) Requirements
+
+- Conda/Mamba (recommended), CUDA GPU optional (CPU works but slower).
+- Three Elliptic CSVs:
+  - `elliptic_txs_features.csv`
+  - `elliptic_txs_classes.csv`
+  - `elliptic_txs_edgelist.csv`
+
+## 1) Environment
+
+```bash
+# create and activate
+conda env create -f environment.yml
+conda activate elliptic-gnn
+
+# if torch-geometric fails for your CUDA, see:
+# https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html
+# CPU fallback: set pytorch-cuda to 'cpuonly' in environment.yml and recreate
+````
+
+## 2) Put data & build graph
+
+Place the CSVs in `data/raw/` and then:
 
 ```bash
 python -m src.data.build_graph --config configs/split.yaml
 ```
 
-This writes `data/processed/graph.pt` and `data/processed/meta.json`.
+This creates `data/processed/graph.pt` & `meta.json`. Splits are temporal (train ≤ 34, val 35–43, test 44–49 by default).
 
-## EDA & Checks
-
-Generate quick sanity tables (degree histogram and labels by timestep) and
-optionally enforce that every edge stays within a single timestep:
+## 3) EDA & checks (sanity + no leakage)
 
 ```bash
 python -m src.analysis.eda --processed_dir data/processed --assert_no_cross_time_edges
 ```
 
-The script writes `degree_hist.csv` and `labels_by_time.csv` alongside the
-processed graph and prints a short summary.
+Outputs:
 
-## 3) Baselines
+* `degree_hist.csv` and `labels_by_time.csv`
+* Guards that **all edges are intra-timestep** (no leakage).
+
+## 4) Baselines
 
 Logistic regression:
 
@@ -57,109 +79,204 @@ Logistic regression:
 python -m src.train_baselines --config configs/baseline_lr.yaml
 ```
 
-XGBoost (GPU if available):
+XGBoost (auto-selects `gpu_hist` when CUDA is visible):
 
 ```bash
 python -m src.train_baselines --config configs/baseline_xgb.yaml
 ```
 
-Artifacts: `outputs/baselines/<run_name>/metrics.json`.
+Artifacts (per run in `outputs/baselines/<run_name>/`):
 
-## 4) GNNs
+* `metrics.json` (PR-AUC_illicit, ROC-AUC, F1@thr, Precision@K, Recall@Precision, ECE, chosen threshold)
+* `training_log.csv` (if implemented)
+* Per-node outputs: `scores_(val|test).npy`, `y_(val|test).npy`, `timestep_(val|test).npy`, `node_idx_(val|test).npy`
 
-GCN / GraphSAGE / GAT:
+## 5) GNNs (GCN / SAGE / GAT)
 
 ```bash
+# Shows GPU info + uses AMP on CUDA
 python -m src.train_gnn --config configs/gcn.yaml
 python -m src.train_gnn --config configs/sage.yaml
 python -m src.train_gnn --config configs/gat.yaml
 ```
 
-On a CUDA machine you should see startup logs similar to:
+You should see:
 
 ```
-[GPU] CUDA available: 1 device(s) -> ['NVIDIA ...'], torch.version.cuda=...
+[GPU] CUDA available: N device(s) -> [...]
 [RUN] Using device: cuda
 ```
 
-Artifacts: `outputs/gnn/<run_name>/metrics.json` and `best.ckpt`.
+Key config toggles:
 
-View TensorBoard with:
+* `device: auto|cpu|cuda`
+* `amp: true` (mixed precision)
+* `symmetrize_edges: false|true`
+* `use_time_scalar: false|true` (append normalized timestep as a feature)
+* `train_window_k: null|<int>` (rolling window over train period)
+* `ablate_hubs_frac: 0.0..0.1` (hub removal eval)
 
-```
+Artifacts (per run in `outputs/gnn/<run_name>/`):
+
+* `best.ckpt`, `metrics.json`, `config_used.yaml`
+* `training_log.csv`, TensorBoard logs at `tb/`
+* Per-node arrays: `scores/y/timestep/node_idx` for val & test
+
+TensorBoard:
+
+```bash
 tensorboard --logdir outputs/gnn/<run_name>/tb
 ```
 
-## Analysis
+## 6) Analysis scripts
 
-After training, run the analysis scripts on a directory that contains
-`metrics.json`, `scores_test.npy`, `y_test.npy`, and `timestep_test.npy`
-(for example `outputs/gnn/<run_name>/`). Each script writes a CSV summary
-and saves a PNG plot alongside the run artifacts.
+By-timestep drift:
 
 ```bash
-# Per-timestep drift analysis
-python src/analysis/eval_by_time.py --run_dir outputs/gnn/<run_name>
-
-# Calibration reliability curve
-python src/analysis/calibration_plots.py --run_dir outputs/gnn/<run_name>
-
-# Precision-vs-workload curve (adjust --k_max as needed)
-python src/analysis/workload_curves.py --run_dir outputs/gnn/<run_name> --k_max 5000
+python -m src.analysis.eval_by_time --run_dir outputs/gnn/gcn_h64
+# writes by_time.csv and by_time_pr_auc.png
 ```
 
-## Interpretability
-
-Explainability examples for the baseline XGBoost model and trained GNNs.
+Calibration curve + ECE:
 
 ```bash
-# SHAP summary for an XGBoost baseline run (re-uses the saved model if available)
-python -m src.analysis.explain xgb --run_dir outputs/baselines/xgb_default --max_plots 10
-
-# GNNExplainer visualization for a specific node
-python -m src.analysis.explain gnn --run_dir outputs/gnn/<run_name> --node 12345
-
-# Let the script auto-pick a high-confidence true/false positive for explanation
-python -m src.analysis.explain gnn --run_dir outputs/gnn/<run_name>
+python -m src.analysis.calibration_plots --run_dir outputs/gnn/gcn_h64
 ```
 
-## 5) Repo layout
+Workload curves (Precision@K):
 
+```bash
+python -m src.analysis.workload_curves --run_dir outputs/gnn/gcn_h64 --k_max 5000
 ```
-.
-├── configs/
-│   ├── split.yaml
-│   ├── baseline_lr.yaml
-│   ├── baseline_xgb.yaml
-│   ├── gcn.yaml
-│   ├── sage.yaml
-│   └── gat.yaml
-├── data/
-│   └── raw/   # <- put CSVs here
-├── outputs/   # run artifacts
-├── src/
-│   ├── __init__.py
-│   ├── data/
-│   │   ├── __init__.py
-│   │   ├── build_graph.py
-│   │   └── dataset_elliptic.py
-│   ├── models/
-│   │   ├── __init__.py
-│   │   └── gnn.py
-│   ├── utils/
-│   │   ├── __init__.py
-│   │   ├── calibrate.py
-│   │   ├── metrics.py
-│   │   └── common.py
-│   ├── train_baselines.py
-│   └── train_gnn.py
-├── environment.yml
-└── README.md
+
+Paired bootstrap (baseline vs GNN):
+
+```bash
+python -m src.analysis.bootstrap_compare \
+  --run_a outputs/baselines/xgb_default \
+  --run_b outputs/gnn/gcn_h64 \
+  --topk 100 --n_boot 1000
+# writes bootstrap_compare.json (ΔPR-AUC, ΔP@K with 95% CIs)
+```
+
+Hub-removed ablation (if enabled in config, writes `metrics_hub_removed.json`);
+you can also use the standalone script if included:
+
+```bash
+python -m src.analysis.hub_ablation --run_dir outputs/gnn/gcn_h64 --frac 0.01
+```
+
+(Optional) Robustness (edge-drop & feature noise) if added:
+
+```bash
+python -m src.analysis.robustness --run_dir outputs/gnn/gcn_h64 --drop_frac 0.10 --noise_std 0.01
+```
+
+## 7) Interpretability
+
+XGBoost + SHAP:
+
+```bash
+python -m src.analysis.explain --mode xgb --run_dir outputs/baselines/xgb_default --max_plots 1
+# shap_summary.png, xgb_top_features.json
+```
+
+GNNExplainer:
+
+```bash
+# auto-selects a node or pass --node <id>
+python -m src.analysis.explain --mode gnn --run_dir outputs/gnn/gcn_h64
+# gnn_explainer_node_<id>.png, gnn_explainer_importance.json
+```
+
+## 8) Small sweeps
+
+```bash
+python -m src.analysis.sweep \
+  --template configs/gcn.yaml \
+  --out_csv outputs/sweeps/gcn_small.csv \
+  --param hidden_dim 64 128 \
+  --param dropout 0.2 0.5 \
+  --param focal_loss false true \
+  --param focal_gamma 1.0 2.0
 ```
 
 ## Notes
 
-- Unknown nodes are never treated as negatives; they only provide graph context.
-- Edges are intra-timestep only, per dataset description.
-- Early stopping monitors **validation PR-AUC (illicit)**.
-- PR curves and Precision@K use **illicit** as the positive class.
+* Unlabeled nodes are never treated as negatives; they provide graph context.
+* Early stopping monitors **val PR-AUC (illicit)**.
+* Thresholds are set on **validation** (Precision target or max-F1) and applied on test.
+
+````
+
+---
+
+## ✅ What to run first (quick checklist)
+
+1) **Create env & activate**
+```bash
+conda env create -f environment.yml && conda activate elliptic-gnn
+````
+
+2. **Put CSVs** into `data/raw/` and **build graph**
+
+```bash
+python -m src.data.build_graph --config configs/split.yaml
+```
+
+3. **Sanity checks**
+
+```bash
+python -m src.analysis.eda --processed_dir data/processed --assert_no_cross_time_edges
+```
+
+4. **Baselines (LR, XGB)**
+
+```bash
+python -m src.train_baselines --config configs/baseline_lr.yaml
+python -m src.train_baselines --config configs/baseline_xgb.yaml
+```
+
+5. **GNNs**
+
+```bash
+python -m src.train_gnn --config configs/gcn.yaml
+```
+
+Expect to see GPU lines. After ~few epochs you’ll get `outputs/gnn/<run>/metrics.json`.
+
+6. **Analysis & plots**
+
+```bash
+python -m src.analysis.eval_by_time --run_dir outputs/gnn/<run>
+python -m src.analysis.calibration_plots --run_dir outputs/gnn/<run>
+python -m src.analysis.workload_curves --run_dir outputs/gnn/<run> --k_max 5000
+```
+
+7. **Compare models (bootstrap)**
+
+```bash
+python -m src.analysis.bootstrap_compare \
+  --run_a outputs/baselines/xgb_default \
+  --run_b outputs/gnn/gcn_h64 \
+  --topk 100 --n_boot 1000
+```
+
+8. **Interpretability**
+
+```bash
+python -m src.analysis.explain --mode xgb --run_dir outputs/baselines/xgb_default
+python -m src.analysis.explain --mode gnn --run_dir outputs/gnn/gcn_h64
+```
+
+---
+
+
+---
+
+### Should you add more code right now?
+
+My recommendation: **test first** with a small run to confirm the plumbing (GPU/AMP lines, metrics saved, analysis scripts produce CSV/PNGs). Then add the **robustness** script (Prompt N) and the **Streamlit UI** (Prompt UI) — both directly support your evaluation section and make your results easy to present.
+
+If you want, I can also give you prompts to add a Dockerfile + Makefile + pre-commit (ruff/black) for smooth grading and reproducibility.
+
