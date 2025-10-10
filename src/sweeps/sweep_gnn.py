@@ -14,7 +14,7 @@ import yaml
 from src.train_gnn import main as train_main
 
 
-# ---------- helpers ----------
+# --------------- helpers ---------------
 def product_dict(**kwargs):
     keys = list(kwargs.keys())
     vals = list(kwargs.values())
@@ -74,7 +74,6 @@ def read_metrics(run_name):
 
 
 def extract_per_timestep(rec):
-    # Try common keys
     for k in [
         "test_pr_auc_by_time",
         "pr_auc_test_by_time",
@@ -87,12 +86,13 @@ def extract_per_timestep(rec):
             if isinstance(v, list):
                 return v
             if isinstance(v, dict):
+                items = list(v.items())
                 try:
                     items = sorted(
                         ((int(t), s) for t, s in v.items()), key=lambda x: x[0]
                     )
                 except Exception:
-                    items = list(v.items())
+                    pass
                 return [s for _, s in items]
     return None
 
@@ -105,17 +105,15 @@ def add_recent_summaries(rec, per_ts):
         rec["pr_auc_last1"] = float(per_ts[-1])
     if n >= 3:
         rec["pr_auc_last3"] = float(sum(per_ts[-3:]) / 3.0)
+        rec["pr_auc_first3"] = float(sum(per_ts[:3]) / 3.0)
     if n >= 5:
         rec["pr_auc_last5"] = float(sum(per_ts[-5:]) / 5.0)
-    if n >= 3:
-        rec["pr_auc_first3"] = float(sum(per_ts[:3]) / 3.0)
     return rec
 
 
 def point_best_to(outdir):
     tgt = os.path.abspath(outdir)
     best_dir = os.path.join("outputs", "gnn", "best")
-    # wipe existing
     if os.path.islink(best_dir):
         try:
             os.unlink(best_dir)
@@ -126,7 +124,6 @@ def point_best_to(outdir):
             shutil.rmtree(best_dir)
         except Exception:
             pass
-    # try symlink
     try:
         os.symlink(tgt, best_dir, target_is_directory=True)
         return "symlink"
@@ -144,27 +141,26 @@ def point_best_to(outdir):
         return "pointer"
 
 
-# ---------- sweep core ----------
+# --------------- sweep core ---------------
 def run_sweep(base_cfg, sweep_grid, rank_key="pr_auc_illicit"):
-    # Build & tidy combos
     combos = list(product_dict(**sweep_grid))
+
+    # normalize set (e.g., time_embed_dim==0 -> disable embed)
     sane_combos = []
     for c in combos:
         c = dict(c)
-        # Normalize "no time embedding"
         if c.get("time_embed_dim", 0) == 0:
             c["time_embed_type"] = "none"
             c["time_embed_l2"] = 0.0
-        # keep sinusoid only for small dims (avoid huge grids)
         if c.get("time_embed_type") == "sin" and c.get("time_embed_dim") not in (2, 4):
             continue
         sane_combos.append(c)
 
-    # ---- De-duplicate combos after normalization ----
+    # De-duplicate combos after normalization
     unique = []
     seen = set()
     for combo in sane_combos:
-        key = json.dumps(combo, sort_keys=True)  # stable signature
+        key = json.dumps(combo, sort_keys=True)
         if key in seen:
             continue
         seen.add(key)
@@ -178,10 +174,11 @@ def run_sweep(base_cfg, sweep_grid, rank_key="pr_auc_illicit"):
 
     for i, combo in enumerate(sane_combos, 1):
         cfg = copy.deepcopy(base_cfg)
-        cfg["symmetrize_edges"] = True  # per your plan
+        cfg["symmetrize_edges"] = True
         for k, v in combo.items():
             cfg[k] = v
 
+        # run_name
         tag = {
             "hidden_dim": "hid",
             "layers": "lay",
@@ -201,18 +198,18 @@ def run_sweep(base_cfg, sweep_grid, rank_key="pr_auc_illicit"):
         rn += "".join([f"_{tag[k]}{slug(cfg[k])}" for k in tag if k in cfg])
         cfg["run_name"] = rn
 
-        # ---- Skip-if-already-finished (resume support) ----
+        # Skip if already finished
         outdir = os.path.join("outputs", "gnn", rn)
         mpath = os.path.join(outdir, "metrics.json")
         if os.path.exists(mpath):
-            print(f"\n[{i}/{len(sane_combos)}] run_name={rn}")
             print(f"[SKIP] {rn} already has metrics.json — skipping")
             rec = read_metrics(rn)
             rec["dt_seconds"] = 0.0
+            rows.append(rec)
             per_ts = extract_per_timestep(rec)
             if per_ts:
+                per_timestep_map[rn] = per_ts
                 add_recent_summaries(rec, per_ts)
-            rows.append(rec)
             continue
 
         print(f"\n[{i}/{len(sane_combos)}] run_name={rn}")
@@ -226,7 +223,6 @@ def run_sweep(base_cfg, sweep_grid, rank_key="pr_auc_illicit"):
 
         rec = read_metrics(rn)
         rec["dt_seconds"] = round(dt, 2)
-
         per_ts = extract_per_timestep(rec)
         if per_ts:
             per_timestep_map[rn] = per_ts
@@ -253,7 +249,7 @@ def run_sweep(base_cfg, sweep_grid, rank_key="pr_auc_illicit"):
                 f"{r.get('dt_seconds', '')}\n"
             )
 
-    # Full metrics TSV
+    # summary tsv
     tsv_path = "outputs/sweeps/last_sweep.tsv"
     fields = [
         "run_name",
@@ -293,14 +289,14 @@ def run_sweep(base_cfg, sweep_grid, rank_key="pr_auc_illicit"):
             w.writerow({k: r.get(k, "") for k in fields})
     print(f"[WROTE] {tsv_path}")
 
-    # JSONL
+    # jsonl
     jsonl_path = "outputs/sweeps/last_sweep.jsonl"
     with open(jsonl_path, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
     print(f"[WROTE] {jsonl_path}")
 
-    # Per-timestep table (if available)
+    # per-timestep
     if per_timestep_map:
         max_T = max(len(v) for v in per_timestep_map.values())
         per_tsv = "outputs/sweeps/last_sweep_per_timestep.tsv"
@@ -312,7 +308,7 @@ def run_sweep(base_cfg, sweep_grid, rank_key="pr_auc_illicit"):
                 w.writerow(row)
         print(f"[WROTE] {per_tsv}")
 
-    # Leaderboard + best/
+    # leaderboard + best/
     def score_of(r):
         return r.get(rank_key, r.get("pr_auc_illicit", float("-inf")))
 
@@ -360,38 +356,37 @@ def run_sweep(base_cfg, sweep_grid, rank_key="pr_auc_illicit"):
             )
 
 
-# ---------- main ----------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--base",
         type=str,
         required=True,
-        help="base YAML (e.g., configs/sage_resbn_k10.yaml)",
+        help="base YAML (e.g., configs/sage_resbn_k8_sin2.yaml)",
     )
     ap.add_argument(
         "--rank_key",
         type=str,
         default="pr_auc_illicit",
-        help="metric to rank by (e.g., pr_auc_illicit, pr_auc_last3)",
+        help="metric to rank by (e.g., pr_auc_last3)",
     )
     args = ap.parse_args()
 
     with open(args.base, "r") as f:
         base_cfg = yaml.safe_load(f)
 
-    # Fast-wins grid (tight time window, tiny/sin time embed, optional L2, time-aware loss)
+    # Narrow grid around current champion (fast iteration)
     sweep_grid = dict(
         hidden_dim=[64],
         layers=[3],
-        dropout=[0.2, 0.3],
-        lr=[5e-4, 1e-3],
-        weight_decay=[5e-5],
-        train_window_k=[6, 8, 10],
-        time_embed_dim=[0, 2, 4],
-        time_embed_type=["learned", "sin", "none"],
+        dropout=[0.2, 0.25],
+        lr=[5e-4, 7e-4],
+        weight_decay=[5e-5, 1e-4],
+        train_window_k=[8, 9, 10],
+        time_embed_dim=[0, 2, 4],  # 0 disables time features
+        time_embed_type=["sin", "none"],  # focus on sin; "none" as control
         time_embed_l2=[0.0, 1e-4],
-        time_loss_weighting=["none", "linear"],  # upweight later steps
+        time_loss_weighting=["none", "sqrt", "linear"],
         symmetrize_edges=[True],
         patience=[30],
     )
