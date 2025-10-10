@@ -16,11 +16,13 @@ from src.utils.metrics import (
     f1_at_threshold,
     pick_threshold_for_precision,
     pick_threshold_max_f1,
-    precision_at_k,
     pr_auc_illicit,
+    precision_at_k,
     recall_at_precision,
     roc_auc_illicit,
 )
+
+# ...existing code...
 
 
 def prepare_data(cfg: dict, device: torch.device):
@@ -69,20 +71,60 @@ def build_edge_index_ablated(
     return edge_index_abl, int(num_hubs)
 
 
-def compute_threshold(cfg: dict, y_val: np.ndarray, p_val: np.ndarray, y_te: np.ndarray, p_te: np.ndarray) -> float:
+def compute_threshold(
+    cfg: dict, y_val: np.ndarray, p_val: np.ndarray, y_te: np.ndarray, p_te: np.ndarray
+) -> float:
     if cfg.get("use_val_for_thresholds", True):
         if cfg.get("precision_target", 0.0) and cfg["precision_target"] > 0:
-            return pick_threshold_for_precision((y_val == 1).astype(int), p_val, cfg["precision_target"])
+            return pick_threshold_for_precision(
+                (y_val == 1).astype(int), p_val, cfg["precision_target"]
+            )
         thr, _ = pick_threshold_max_f1((y_val == 1).astype(int), p_val)
         return thr
     thr, _ = pick_threshold_max_f1((y_te == 1).astype(int), p_te)
     return thr
 
 
+def _infer_expected_in_features_from_state(model: torch.nn.Module) -> int | None:
+    # Try common GraphSAGE linear weight keys first, else first 2D weight we find.
+    sd = model.state_dict()
+    for suffix in ("lin_l.weight", "lin_rel.weight", "lin.weight"):
+        for k, w in sd.items():
+            if k.endswith(suffix) and w.dim() == 2:
+                return int(w.shape[1])
+    for _, w in sd.items():
+        if w.dim() == 2:
+            return int(w.shape[1])
+    return None
+
+
+def _align_features_to_model(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    expected_in = _infer_expected_in_features_from_state(model)
+    cur_in = int(x.size(1))
+    if expected_in is None or expected_in == cur_in:
+        return x
+    if cur_in < expected_in:
+        pad = torch.zeros(
+            x.size(0), expected_in - cur_in, device=x.device, dtype=x.dtype
+        )
+        x = torch.cat([x, pad], dim=1)
+        print(f"[ABL] padded features {cur_in} -> {expected_in}")
+    else:
+        x = x[:, :expected_in]
+        print(f"[ABL] truncated features {cur_in} -> {expected_in}")
+    return x
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate hub ablation for a trained GNN run")
-    parser.add_argument("--run_dir", type=Path, required=True, help="Path to the GNN run directory")
-    parser.add_argument("--frac", type=float, default=0.01, help="Fraction of nodes to ablate as hubs")
+    parser = argparse.ArgumentParser(
+        description="Evaluate hub ablation for a trained GNN run"
+    )
+    parser.add_argument(
+        "--run_dir", type=Path, required=True, help="Path to the GNN run directory"
+    )
+    parser.add_argument(
+        "--frac", type=float, default=0.01, help="Fraction of nodes to ablate as hubs"
+    )
     args = parser.parse_args()
 
     run_dir = args.run_dir
@@ -98,11 +140,15 @@ def main() -> None:
     device = torch.device("cuda" if gpu_available() else "cpu")
     data = prepare_data(cfg, device)
 
+    # Build model and load weights
     in_dim = data.x.size(1)
     model = build_model(cfg["arch"], in_dim, cfg).to(device)
     state_dict = torch.load(run_dir / "best.ckpt", map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
+
+    # Align features to the trained model's expected input width (handles feature-engineering mismatches)
+    data.x = _align_features_to_model(model, data.x)
 
     edge_index = data.edge_index
     with torch.no_grad():
@@ -124,7 +170,9 @@ def main() -> None:
     p_te = probs_base[test_mask]
 
     thr = compute_threshold(cfg, y_val, p_val, y_te, p_te)
-    edge_index_abl, n_hubs = build_edge_index_ablated(edge_index, data.num_nodes, args.frac, device)
+    edge_index_abl, n_hubs = build_edge_index_ablated(
+        edge_index, data.num_nodes, args.frac, device
+    )
 
     with torch.no_grad():
         logits_abl = model(data.x, edge_index_abl)
@@ -141,7 +189,9 @@ def main() -> None:
         "f1_illicit_at_thr": f1_at_threshold(y_bin, p_te_abl, thr),
         "threshold": thr,
         "precision_at_k": precision_at_k(y_bin, p_te_abl, cfg.get("topk", 100)),
-        "recall_at_precision": recall_at_precision(y_bin, p_te_abl, cfg.get("precision_target", 0.90)),
+        "recall_at_precision": recall_at_precision(
+            y_bin, p_te_abl, cfg.get("precision_target", 0.90)
+        ),
         "ece": expected_calibration_error(y_bin, p_te_abl),
         "n_test": int(len(y_te)),
         "n_hubs": int(n_hubs),
