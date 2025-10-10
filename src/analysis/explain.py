@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import yaml
 from torch_geometric.data import Data
+from torch_geometric.utils import k_hop_subgraph, to_networkx
 from xgboost import XGBClassifier
 
 plt.switch_backend("Agg")
@@ -632,6 +633,8 @@ def run_gnn(args: argparse.Namespace) -> None:
         node_feat_mask, edge_mask = explainer.explain_node(
             node_id, data.x, data.edge_index, target=1
         )
+        png_path = run_dir / f"gnn_explainer_node_{node_id}.png"
+        _save_subgraph_png(node_id, data, edge_mask, png_path, k=2)
         # Optional viz if available
         try:
             _, ax = explainer.visualize_subgraph(  # type: ignore[attr-defined]
@@ -649,7 +652,8 @@ def run_gnn(args: argparse.Namespace) -> None:
         explainer = ExplainerCls(**expl_kwargs)  # type: ignore[misc]
         explanation = _run_explainer_node(explainer, data, node_id)
         node_feat_mask, edge_mask = _unpack_masks_from_explanation(explanation, data)
-
+        png_path = run_dir / f"gnn_explainer_node_{node_id}.png"
+        _save_subgraph_png(node_id, data, edge_mask, png_path, k=2)
         # Best-effort visualization
         try:
             if hasattr(explanation, "visualize_subgraph"):
@@ -666,7 +670,7 @@ def run_gnn(args: argparse.Namespace) -> None:
         except Exception:
             pass
 
-    # Export importances
+    # -------- Export importances (robust to 1D or 2D feature masks) --------
     edge_mask_np = edge_mask.detach().cpu().numpy()
     edge_index_np = data.edge_index.cpu().numpy()
     top_edge_idx = np.argsort(edge_mask_np)[::-1][:20]
@@ -679,14 +683,32 @@ def run_gnn(args: argparse.Namespace) -> None:
         for i in top_edge_idx
     ]
 
+    # node_feat_mask can be:
+    #  - 1D: [F]
+    #  - 2D: [N, F]  (most new-API cases)
+    #  - weird shapes: collapse to [F]
     feat_mask_np = node_feat_mask.detach().cpu().numpy()
-    feature_names = [f"f{i}" for i in range(feat_mask_np.shape[0])]
+    if feat_mask_np.ndim == 1:
+        feat_vec = feat_mask_np
+    elif feat_mask_np.ndim == 2:
+        # aggregate across nodes
+        feat_vec = np.mean(np.abs(feat_mask_np), axis=0)
+    else:
+        # e.g., [something, F] -> flatten nodes/anything and average on last dim
+        feat_vec = np.reshape(feat_mask_np, (-1, feat_mask_np.shape[-1]))
+        feat_vec = np.mean(np.abs(feat_vec), axis=0)
+
+    # Make feature names match the feature dimension (last dim)
+    num_feats = int(feat_vec.shape[0])
+    feature_names = [f"f{i}" for i in range(num_feats)]
     if cfg.get("use_time_scalar", False) and int(cfg.get("time_embed_dim", 0)) == 0:
+        # last column is the appended normalized timestep
         feature_names[-1] = "time_scalar"
 
+    order = np.argsort(feat_vec)[::-1][: min(20, num_feats)]
     feature_importance = [
-        {"feature": feature_names[i], "importance": float(feat_mask_np[i])}
-        for i in np.argsort(feat_mask_np)[::-1][: min(20, len(feature_names))]
+        {"feature": feature_names[int(i)], "importance": float(feat_vec[int(i)])}
+        for i in order
     ]
 
     # NOTE: Use the ORIGINAL model (2 logits) to compute probabilities for the report
@@ -746,6 +768,63 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.run_dir = args.run_dir.resolve()
     return args
+
+
+def _save_subgraph_png(node_id, data, edge_mask, out_path, k=2):
+    try:
+        import networkx as nx  # optional
+    except ImportError:
+        print("[WARN] networkx not installed; skipping PNG")
+        return
+
+    # Ensure parent folder exists (e.g., run_dir)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Build k-hop subgraph and a boolean mask over *global* edges
+    subset, sub_edge_index, _, edge_mask_global_bool = k_hop_subgraph(
+        node_id, k, data.edge_index, relabel_nodes=True, num_nodes=data.num_nodes
+    )
+
+    # Align explainer edge scores to the subgraph edges
+    # (filter the global edge_mask by the boolean selector returned above)
+    sub_edge_scores = edge_mask[edge_mask_global_bool].detach().cpu().numpy()
+    if sub_edge_scores.ndim > 1:
+        sub_edge_scores = np.squeeze(sub_edge_scores)
+
+    # Construct a NetworkX graph from the subgraph
+    G = to_networkx(
+        Data(num_nodes=subset.size(0), edge_index=sub_edge_index),
+        to_undirected=True,
+    )
+
+    # Normalize widths by score (optional, but looks nicer)
+    if sub_edge_scores.size > 0:
+        s = sub_edge_scores - sub_edge_scores.min()
+        denom = s.max() if s.max() > 0 else 1.0
+        widths = (0.5 + 3.0 * (s / denom)).tolist()
+    else:
+        widths = [0.5] * sub_edge_index.size(1)
+
+    # Center node in red; others default
+    node_colors = [
+        "#ff6b6b" if i == 0 else "#1f77b4" for i in range(G.number_of_nodes())
+    ]
+
+    pos = nx.spring_layout(G, seed=0)
+
+    plt.figure(figsize=(7, 6))
+    nx.draw(
+        G,
+        pos=pos,
+        with_labels=False,
+        node_size=60,
+        node_color=node_colors,
+        width=widths,
+    )
+    plt.title(f"GNNExplainer subgraph for node {node_id}")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
 
 
 def main() -> None:
