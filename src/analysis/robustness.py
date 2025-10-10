@@ -1,6 +1,8 @@
+# src/analysis/robustness.py
 import argparse
 import json
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -14,16 +16,24 @@ from src.utils.common import gpu_available, set_seed
 from src.utils.metrics import (
     expected_calibration_error,
     f1_at_threshold,
-    precision_at_k,
     pr_auc_illicit,
+    precision_at_k,
     recall_at_precision,
     roc_auc_illicit,
 )
 
 
+def _model_uses_time_embed(model) -> bool:
+    return (
+        hasattr(model, "time_embed_dim")
+        and int(getattr(model, "time_embed_dim", 0)) > 0
+    )
+
+
 def prepare_data(cfg: dict, processed_dir: Path, device: torch.device) -> Data:
     data = load_cached(str(processed_dir))
 
+    # Optional rolling window (match training)
     window_k = cfg.get("train_window_k")
     if window_k is not None:
         window_k = int(window_k)
@@ -37,7 +47,8 @@ def prepare_data(cfg: dict, processed_dir: Path, device: torch.device) -> Data:
         t_val_end = int(val_ts.max().item())
         data = make_temporal_masks(data, t_train_end, t_val_end, window_k)
 
-    if cfg.get("use_time_scalar", False):
+    # Optional scalar time (only if used during training and no time embedding)
+    if cfg.get("use_time_scalar", False) and int(cfg.get("time_embed_dim", 0)) == 0:
         tnorm = (data.timestep.float() / float(data.timestep.max())).unsqueeze(1)
         data.x = torch.cat([data.x, tnorm], dim=1)
 
@@ -51,7 +62,7 @@ def build_edge_index(cfg: dict, data: Data) -> torch.Tensor:
     return edge_index
 
 
-def drop_edges(edge_index: torch.Tensor, drop_frac: float) -> tuple[torch.Tensor, int]:
+def drop_edges(edge_index: torch.Tensor, drop_frac: float) -> Tuple[torch.Tensor, int]:
     drop_frac = float(drop_frac)
     if drop_frac < 0 or drop_frac > 1:
         raise ValueError("drop_frac must be within [0, 1]")
@@ -85,9 +96,12 @@ def compute_probs(
     data: Data,
     edge_index: torch.Tensor,
     use_temp_scale: bool,
-) -> tuple[np.ndarray, float]:
+) -> Tuple[np.ndarray, float]:
+    # --- forward with (optional) time embedding ---
     with torch.no_grad():
-        logits = model(x_input, edge_index)
+        t_idx = data.timestep if _model_uses_time_embed(model) else None
+        logits = model(x_input, edge_index, t_idx)
+
     temperature = 1.0
     if use_temp_scale:
         val_mask = data.val_mask
@@ -98,16 +112,39 @@ def compute_probs(
             _ = ts.fit(logits[val_mask], data.y[val_mask])
             logits = logits / ts.T
             temperature = float(ts.T.detach().cpu().item())
+
     probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
     return probs, temperature
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate robustness of a trained GNN under noise and edge drop")
-    parser.add_argument("--run_dir", type=Path, required=True, help="Path to the trained GNN run directory")
-    parser.add_argument("--processed_dir", type=Path, default=Path("data/processed"), help="Directory containing processed graph.pt")
-    parser.add_argument("--drop_frac", type=float, default=0.10, help="Fraction of edges to drop uniformly at random")
-    parser.add_argument("--noise_std", type=float, default=0.01, help="Stddev of Gaussian noise added to node features")
+    parser = argparse.ArgumentParser(
+        description="Evaluate robustness of a trained GNN under noise and edge drop"
+    )
+    parser.add_argument(
+        "--run_dir",
+        type=Path,
+        required=True,
+        help="Path to the trained GNN run directory",
+    )
+    parser.add_argument(
+        "--processed_dir",
+        type=Path,
+        default=Path("data/processed"),
+        help="Directory containing processed graph.pt",
+    )
+    parser.add_argument(
+        "--drop_frac",
+        type=float,
+        default=0.10,
+        help="Fraction of edges to drop uniformly at random",
+    )
+    parser.add_argument(
+        "--noise_std",
+        type=float,
+        default=0.01,
+        help="Stddev of Gaussian noise added to node features",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
@@ -132,7 +169,11 @@ def main() -> None:
         raise KeyError("metrics.json does not contain 'threshold'")
     threshold = float(base_metrics["threshold"])
 
-    processed_dir = args.processed_dir if args.processed_dir is not None else Path(cfg.get("processed_dir", "data/processed"))
+    processed_dir = (
+        args.processed_dir
+        if args.processed_dir is not None
+        else Path(cfg.get("processed_dir", "data/processed"))
+    )
     graph_path = processed_dir / "graph.pt"
     if not graph_path.exists():
         raise FileNotFoundError(f"Processed graph not found at {graph_path}")
@@ -140,20 +181,23 @@ def main() -> None:
     device = torch.device("cuda" if gpu_available() else "cpu")
     data = prepare_data(cfg, processed_dir, device)
 
+    # Build model exactly as in training (includes time-embed configuration)
     in_dim = data.x.size(1)
     model = build_model(cfg["arch"], in_dim, cfg).to(device)
     state_dict = torch.load(run_dir / "best.ckpt", map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
 
+    # Edge drop + feature noise
     edge_index_original = build_edge_index(cfg, data)
     edge_index, drop_count = drop_edges(edge_index_original, args.drop_frac)
-
     x_input = maybe_add_noise(data.x, args.noise_std)
 
+    # Temperature scaling consistent with training pipeline
     use_temp_scale = bool(cfg.get("calibrate_temperature", True))
     probs, temperature = compute_probs(model, x_input, data, edge_index, use_temp_scale)
 
+    # Metrics on TEST
     y_np = data.y.detach().cpu().numpy()
     test_mask = data.test_mask.detach().cpu().numpy().astype(bool)
     y_test = y_np[test_mask]
@@ -174,7 +218,9 @@ def main() -> None:
         "ece": expected_calibration_error(y_bin, p_test),
         "n_test": int(len(y_test)),
         "drop_frac_requested": float(args.drop_frac),
-        "drop_frac_effective": float(drop_count / n_edges_original) if n_edges_original else 0.0,
+        "drop_frac_effective": float(drop_count / n_edges_original)
+        if n_edges_original
+        else 0.0,
         "edges_dropped": int(drop_count),
         "n_edges_original": n_edges_original,
         "n_edges_after_drop": int(edge_index.size(1)),
