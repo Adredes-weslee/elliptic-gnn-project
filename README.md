@@ -1,9 +1,8 @@
 
 ---
 
-# ✅ Updated README (drop-in)
+# ✅ README 
 
-Replace your README’s quickstart/run instructions with this block.
 
 # Catching Illicit Crypto Flows — Elliptic GNN Project
 
@@ -130,35 +129,37 @@ tensorboard --logdir outputs/gnn/<run_name>/tb
 Per-timestep drift:
 
 ```bash
-python -m src.analysis.eval_by_time --run_dir outputs/gnn/gcn_h64
+python -m src.analysis.eval_by_time --run_dir outputs/gnn/rec_sage_resbn_k8_sin2
 # by_time.csv, by_time_pr_auc.png
 ```
 
 Calibration curve:
 
 ```bash
-python -m src.analysis.calibration_plots --run_dir outputs/gnn/gcn_h64
+python -m src.analysis.calibration_plots --run_dir outputs/gnn/rec_sage_resbn_k8_sin2
 ```
 
 Workload (Precision@K):
 
 ```bash
-python -m src.analysis.workload_curves --run_dir outputs/gnn/gcn_h64 --k_max 5000
+python -m src.analysis.workload_curves --run_dir outputs/gnn/rec_sage_resbn_k8_sin2 --k_max 5000
 ```
 
 Paired bootstrap (baseline vs GNN):
 
 ```bash
-python -m src.analysis.bootstrap_compare \
-  --run_a outputs/baselines/xgb_default \
-  --run_b outputs/gnn/gcn_h64 \
-  --topk 100 --n_boot 1000
+python -m src.analysis.bootstrap_compare --run_a outputs/baselines/xgb_default --run_b outputs/gnn/rec_sage_resbn_k8_sin2 --topk 100 --n_boot 1000
 ```
 
 Hub-removed ablation:
 
 ```bash
-python -m src.analysis.hub_ablation --run_dir outputs/gnn/gcn_h64 --frac 0.01
+python -m src.analysis.hub_ablation --run_dir outputs/gnn/rec_sage_resbn_k8_sin2 --frac 0.01
+```
+
+Robustness:
+```bash
+python -m src.analysis.robustness --run_dir outputs/gnn/rec_sage_resbn_k8_sin2
 ```
 
 ## 7) Interpretability
@@ -166,13 +167,13 @@ python -m src.analysis.hub_ablation --run_dir outputs/gnn/gcn_h64 --frac 0.01
 XGBoost + SHAP:
 
 ```bash
-python -m src.analysis.explain --mode xgb --run_dir outputs/baselines/xgb_default --max_plots 1
+python -m src.analysis.explain xgb --run_dir outputs/baselines/xgb_default --max_plots 1
 ```
 
 GNNExplainer:
 
 ```bash
-python -m src.analysis.explain --mode gnn --run_dir outputs/gnn/gcn_h64
+python -m src.analysis.explain gnn --run_dir outputs/gnn/rec_sage_resbn_k8_sin2 --epochs 200
 ```
 
 ## 8) Streamlit Dashboard
@@ -187,40 +188,5 @@ Browse runs under `outputs/…`:
 * By-timestep drift plot
 * Optional bootstrap deltas & hub-removed metrics (if present)
 
-## What to do first
-
-1. Build graph → confirm edges ≈ 234k
-2. Run LR and XGB → get baseline metrics
-3. Run GCN → confirm GPU/AMP + better PR-AUC than baselines
-4. Generate plots + Streamlit to review
-5. Then tune/sweeps (hidden_dim, dropout, class weighting / focal) and run paired bootstrap vs baselines.
 
 
-
-
----
-
-# 🧪 (Optional) Codex micro-prompt — smoke-test thresholds for baselines
-
-If your smoke tests keep producing F1=0 because `precision_target: 0.90` is too strict, paste this to Codex to tweak the default configs:
-
-```
-Open configs/baseline_lr.yaml and configs/baseline_xgb.yaml and set:
-precision_target: 0.0    # use max-F1 for smoke tests
-# keep a commented line with your final target (e.g., 0.90) to restore later
-```
-
-(You can restore your 0.90 target once models start producing good precision.)
-
----
-
-## Should you implement more now, or test first?
-
-**Test first.** After the loader patch, rebuild the graph and verify **edges > 0**. Then run LR/XGB and one GNN (GCN). Generate the analysis plots and open your Streamlit app. Once the plumbing looks good, move on to:
-
-* **Rolling window (`train_window_k`)** sensitivity
-* **Symmetrize edges** toggle
-* **Hub-removed ablation** (`ablate_hubs_frac`)
-* **Paired bootstrap** (GNN vs best baseline)
-
-If anything still looks off (e.g., edges still 0), share the first 5 rows + dtypes of each CSV and we’ll adjust the loader immediately.
