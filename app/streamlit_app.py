@@ -1,4 +1,5 @@
 """Streamlit dashboard for exploring model run outputs."""
+
 from __future__ import annotations
 
 import json
@@ -13,10 +14,10 @@ RUN_TYPES = ["baselines", "gnn", "all"]
 OUTPUT_ROOT = Path("outputs")
 
 
+# -------------------- discovery --------------------
 def scan_run_directories(root: Path = OUTPUT_ROOT) -> Dict[str, List[Path]]:
     """Return a mapping of run type to available run directories."""
     runs: Dict[str, List[Path]] = {run_type: [] for run_type in RUN_TYPES}
-
     if not root.exists():
         return runs
 
@@ -34,7 +35,6 @@ def scan_run_directories(root: Path = OUTPUT_ROOT) -> Dict[str, List[Path]]:
 
     for key in runs:
         runs[key] = sorted(set(runs[key]))
-
     return runs
 
 
@@ -45,6 +45,7 @@ def format_run_option(run_dir: Path) -> str:
         return str(run_dir)
 
 
+# -------------------- io helpers --------------------
 def load_json(path: Path) -> Optional[Dict]:
     if not path.exists():
         return None
@@ -56,83 +57,94 @@ def load_json(path: Path) -> Optional[Dict]:
         return None
 
 
+def load_csv(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    try:
+        return pd.read_csv(path)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to read CSV {path}: {exc}")
+        return None
+
+
 def nested_get(mapping: Dict, keys: Iterable[str]) -> Optional[float]:
+    cur = mapping
     for key in keys:
-        if mapping is None:
+        if not isinstance(cur, dict):
             return None
-        if isinstance(mapping, dict):
-            mapping = mapping.get(key)
-        else:
-            return None
-    if isinstance(mapping, (int, float)):
-        return float(mapping)
+        cur = cur.get(key)
+    if isinstance(cur, (int, float)):
+        return float(cur)
     return None
 
 
+# -------------------- metrics table --------------------
 def metrics_table(metrics: Dict) -> pd.DataFrame:
     rows: List[Tuple[str, Optional[float]]] = []
 
+    # Map display label -> possible keys in your various writers
     value_map = {
-        "PR-AUC": ["pr_auc"],
+        "PR-AUC (illicit)": ["pr_auc_illicit", "pr_auc"],
         "ROC-AUC": ["roc_auc"],
-        "F1@thr": ["f1_at_threshold", "f1"],
+        "F1@thr (illicit)": ["f1_illicit_at_thr", "f1_at_threshold", "f1"],
         "P@K": ["precision_at_k", "p_at_k", "precision_at_k_value"],
         "Recall@P": ["recall_at_precision", "recall_at_p"],
         "ECE": ["ece", "expected_calibration_error"],
         "thr": ["threshold", "thr", "decision_threshold"],
+        "best_val_pr_auc": ["best_val_pr_auc"],
+        "pr_auc_last1": ["pr_auc_last1"],
+        "pr_auc_last3": ["pr_auc_last3"],
+        "pr_auc_last5": ["pr_auc_last5"],
+        "n_test": ["n_test"],
     }
 
     for label, keys in value_map.items():
         value = None
         for key in keys:
             if key in metrics:
-                candidate = metrics.get(key)
-                if isinstance(candidate, dict):
-                    value = (
-                        candidate.get("value")
-                        or candidate.get("score")
-                        or candidate.get("precision")
-                        or candidate.get("recall")
-                    )
-                elif isinstance(candidate, (int, float)):
-                    value = candidate
+                v = metrics.get(key)
+                if isinstance(v, dict):
+                    # handle nested {"value": ...} or similar shapes
+                    value = v.get("value") or v.get("score") or v.get("mean")
+                elif isinstance(v, (int, float)):
+                    value = v
                 if value is not None:
                     break
         if value is None:
-            # Attempt nested access such as precision_at_k -> value.
             value = nested_get(metrics, [keys[0], "value"])
-        rows.append((label, value))
+        rows.append((label, None if value is None else float(value)))
 
-    df = pd.DataFrame(rows, columns=["Metric", "Value"])
-    return df
+    return pd.DataFrame(rows, columns=["Metric", "Value"])
 
 
 def load_hub_ablation(run_dir: Path) -> Optional[pd.DataFrame]:
-    path = run_dir / "hub_ablation_metrics.json"
+    # Your training script writes "metrics_hub_removed.json"
+    path = run_dir / "metrics_hub_removed.json"
     data = load_json(path)
     if not data:
         return None
-    return pd.DataFrame(data)
-
-
-def load_csv(path: Path) -> Optional[pd.DataFrame]:
-    if not path.exists():
-        return None
+    # Normalize to a one-row table
+    if isinstance(data, dict):
+        return pd.DataFrame([data])
     try:
-        return pd.read_csv(path)
-    except Exception as exc:  # pylint: disable=broad-except
-        st.error(f"Failed to read CSV {path}: {exc}")
+        return pd.DataFrame(data)
+    except Exception:  # noqa: BLE001
         return None
 
 
-def show_overview_tab(run_dir: Path, threshold_source: str, custom_threshold: float) -> None:
+# -------------------- tabs --------------------
+def show_overview_tab(
+    run_dir: Path, threshold_source: str, custom_threshold: float
+) -> None:
+    st.markdown(f"**Run:** `{run_dir}`")
+
     metrics_path = run_dir / "metrics.json"
     metrics = load_json(metrics_path)
-
     if not metrics:
         st.warning("metrics.json was not found or could not be parsed for this run.")
         return
 
+    # Some writers nest under "metrics"/"test"/"results" – flatten if present
     metrics_section = metrics
     for candidate in ("metrics", "test", "results"):
         if isinstance(metrics.get(candidate), dict):
@@ -145,10 +157,10 @@ def show_overview_tab(run_dir: Path, threshold_source: str, custom_threshold: fl
 
     if threshold_source == "Use slider":
         st.caption(f"Using custom decision threshold: {custom_threshold:.3f}")
-    elif "thr" in df["Metric"].values:
-        thr_value = df.loc[df["Metric"] == "thr", "Value"].iloc[0]
-        if thr_value is not None:
-            st.caption(f"Run decision threshold: {thr_value:.3f}")
+    else:
+        thr_row = df.loc[df["Metric"] == "thr"]
+        if not thr_row.empty and pd.notnull(thr_row["Value"].iloc[0]):
+            st.caption(f"Run decision threshold: {thr_row['Value'].iloc[0]:.3f}")
 
     hub_ablation = load_hub_ablation(run_dir)
     if hub_ablation is not None and not hub_ablation.empty:
@@ -157,11 +169,15 @@ def show_overview_tab(run_dir: Path, threshold_source: str, custom_threshold: fl
 
 
 def show_curves_tab(run_dir: Path) -> None:
-    image_path = run_dir / "by_time_pr_auc.png"
-    if image_path.exists():
-        st.image(str(image_path), caption="PR-AUC by time")
-    else:
-        st.info("No PR-AUC by time image available.")
+    # quick visuals that are typically present
+    for name, caption in [
+        ("by_time_pr_auc.png", "PR-AUC by time"),
+        ("calibration_curve.png", "Calibration curve"),
+        ("workload_curve.png", "Workload Precision@K curve"),
+    ]:
+        p = run_dir / name
+        if p.exists():
+            st.image(str(p), caption=caption)
 
 
 def show_drift_tab(run_dir: Path, enabled: bool) -> None:
@@ -188,7 +204,10 @@ def show_drift_tab(run_dir: Path, enabled: bool) -> None:
             break
 
     if not metric_column or not timestep_column:
-        st.warning("by_time.csv does not contain recognizable timestep or PR-AUC columns.")
+        st.warning(
+            "by_time.csv does not contain recognizable timestep or PR-AUC columns."
+        )
+        st.dataframe(df.head())
         return
 
     fig = px.line(df, x=timestep_column, y=metric_column, title="PR-AUC over time")
@@ -213,7 +232,7 @@ def show_workload_tab(run_dir: Path, enabled: bool) -> None:
         return
 
     image_path = run_dir / "workload_curve.png"
-    csv_path = run_dir / "workload.csv"
+    csv_path = run_dir / "workload_curve.csv"  # <-- your writer uses this name
 
     if image_path.exists():
         st.image(str(image_path), caption="Workload curve")
@@ -222,30 +241,35 @@ def show_workload_tab(run_dir: Path, enabled: bool) -> None:
 
     df = load_csv(csv_path)
     if df is not None and not df.empty:
-        x_col = None
-        y_col = None
-        for candidate in ("k", "K", "top_k"):
-            if candidate in df.columns:
-                x_col = candidate
-                break
-        for candidate in ("precision", "precision_at_k", "p@k"):
-            if candidate in df.columns:
-                y_col = candidate
-                break
+        # Column names you produce: typically 'k' and 'precision'
+        x_col = next((c for c in ("k", "K", "top_k") if c in df.columns), None)
+        y_col = next(
+            (c for c in ("precision", "precision_at_k", "p@k") if c in df.columns), None
+        )
         if x_col and y_col:
-            fig = px.line(df, x=x_col, y=y_col, title="Precision vs K")
+            fig = px.line(df, x=x_col, y=y_col, title="Precision vs K (from CSV)")
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("workload.csv does not contain recognizable columns for plotting precision vs K.")
+            st.warning(
+                "workload_curve.csv does not contain recognizable columns for plotting."
+            )
+            st.dataframe(df.head())
 
 
-def extract_delta(data: Dict, keys: Iterable[str]) -> Optional[Tuple[float, Optional[float], Optional[float]]]:
+def extract_delta(
+    data: Dict, keys: Iterable[str]
+) -> Optional[Tuple[float, Optional[float], Optional[float]]]:
     for key in keys:
         if key not in data:
             continue
         entry = data[key]
         if isinstance(entry, dict):
-            delta = entry.get("delta") or entry.get("estimate") or entry.get("mean") or entry.get("value")
+            delta = (
+                entry.get("delta")
+                or entry.get("estimate")
+                or entry.get("mean")
+                or entry.get("value")
+            )
             lower = entry.get("ci_low") or entry.get("lower") or entry.get("low")
             upper = entry.get("ci_high") or entry.get("upper") or entry.get("high")
             if delta is not None:
@@ -309,13 +333,33 @@ def show_compare_tab(run_dir: Path, comparison_dir: Optional[Path]) -> None:
 
 
 def show_artifacts_tab(run_dir: Path) -> None:
-    artifact_paths = []
-    for candidate in ("metrics.json", "config_used.yaml"):
-        path = run_dir / candidate
-        if path.exists():
-            artifact_paths.append(path)
+    # Prioritize human-readable first
+    priority = [
+        "metrics.json",
+        "config_used.yaml",
+        "by_time.csv",
+        "workload_curve.csv",
+        "training_log.csv",
+        "metrics_hub_removed.json",
+        "robustness_*.json",
+        "bootstrap_compare*.json",
+        "*.png",
+        "*.csv",
+        "*.npy",
+        "best.ckpt",
+    ]
 
-    artifact_paths.extend(sorted(run_dir.glob("*.png")))
+    files: List[Path] = []
+    for pattern in priority:
+        files.extend(sorted(run_dir.glob(pattern)))
+
+    # De-duplicate while preserving order
+    seen = set()
+    artifact_paths = []
+    for p in files:
+        if p.exists() and p.is_file() and p not in seen:
+            seen.add(p)
+            artifact_paths.append(p)
 
     if not artifact_paths:
         st.info("No downloadable artifacts found in the run directory.")
@@ -331,6 +375,7 @@ def show_artifacts_tab(run_dir: Path) -> None:
             )
 
 
+# -------------------- app --------------------
 def main() -> None:
     st.set_page_config(page_title="Run Dashboard", layout="wide")
     st.title("Run Metrics Dashboard")
@@ -341,7 +386,11 @@ def main() -> None:
         st.header("Run selection")
         run_type = st.selectbox("Run type", RUN_TYPES, index=RUN_TYPES.index("all"))
 
-        options = run_directories.get(run_type, []) if run_type != "all" else run_directories["all"]
+        options = (
+            run_directories.get(run_type, [])
+            if run_type != "all"
+            else run_directories["all"]
+        )
         option_labels = [format_run_option(path) for path in options]
         label_to_path = dict(zip(option_labels, options))
         if option_labels:
@@ -354,13 +403,19 @@ def main() -> None:
         comparison_dir: Optional[Path] = None
         comparison_options = run_directories["all"]
         if comparison_options:
-            comparison_labels = ["None"] + [format_run_option(path) for path in comparison_options]
-            selected_comparison = st.selectbox("Comparison run (optional)", comparison_labels, index=0)
+            comparison_labels = ["None"] + [
+                format_run_option(path) for path in comparison_options
+            ]
+            selected_comparison = st.selectbox(
+                "Comparison run (optional)", comparison_labels, index=0
+            )
             if selected_comparison != "None":
                 comparison_map = dict(zip(comparison_labels[1:], comparison_options))
                 comparison_dir = comparison_map.get(selected_comparison)
 
-        threshold_source = st.radio("Threshold source", ["Use run threshold", "Use slider"], index=0)
+        threshold_source = st.radio(
+            "Threshold source", ["Use run threshold", "Use slider"], index=0
+        )
         custom_threshold = st.slider(
             "Custom threshold",
             0.0,
@@ -375,12 +430,26 @@ def main() -> None:
 
     if selected_dir is None:
         if run_directories["all"]:
-            st.info("Select a different run type or generate metrics for the chosen category.")
+            st.info(
+                "Select a different run type or generate metrics for the chosen category."
+            )
         else:
-            st.info("No runs found. Add run outputs under the `outputs/` directory to begin.")
+            st.info(
+                "No runs found. Add run outputs under the `outputs/` directory to begin."
+            )
         return
 
-    tabs = st.tabs(["Overview", "Curves", "Drift", "Calibration", "Workload", "Compare", "Artifacts"])
+    tabs = st.tabs(
+        [
+            "Overview",
+            "Curves",
+            "Drift",
+            "Calibration",
+            "Workload",
+            "Compare",
+            "Artifacts",
+        ]
+    )
 
     with tabs[0]:
         show_overview_tab(selected_dir, threshold_source, custom_threshold)
