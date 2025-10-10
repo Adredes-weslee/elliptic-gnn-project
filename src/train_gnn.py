@@ -1,3 +1,4 @@
+# src/train_gnn.py
 import argparse
 import inspect
 import json
@@ -126,7 +127,7 @@ def _model_uses_time_embed(model):
     return hasattr(model, "time_embed_dim") and getattr(model, "time_embed_dim") > 0
 
 
-# -------- NEW: time-aware loss weighting + optional embedding L2 --------
+# -------- time-aware loss weighting + optional embedding L2 --------
 def _norm_train_time(t_vec, t_min, t_max):
     denom = max(float(t_max - t_min), 1.0)
     return (t_vec.float() - float(t_min)) / denom
@@ -136,10 +137,12 @@ def _make_loss_fn(cfg, cw, model, t_min, t_max):
     """
     Returns a callable: (logits, target, t_idx) -> scalar loss
     - focal_loss supported (cfg.focal_loss)
-    - linear time weighting (cfg.time_loss_weighting == 'linear')
+    - time weighting: cfg.time_loss_weighting in {'none','linear','sqrt'}
     - optional L2 on learned time embedding (cfg.time_embed_l2)
     """
-    use_linear_time = cfg.get("time_loss_weighting", "none") == "linear"
+    use_scheme = str(
+        cfg.get("time_loss_weighting", "none")
+    )  # "none" | "linear" | "sqrt"
     embed_l2 = float(cfg.get("time_embed_l2", 0.0))
     use_focal = bool(cfg.get("focal_loss", False))
     gamma = float(cfg.get("focal_gamma", 2.0))
@@ -158,8 +161,14 @@ def _make_loss_fn(cfg, cw, model, t_min, t_max):
             )
 
         # optional time reweight
-        if use_linear_time and t_idx is not None:
+        if use_scheme != "none" and t_idx is not None:
             wt = _norm_train_time(t_idx, t_min, t_max).to(logits.device)
+            if use_scheme == "sqrt":
+                wt = torch.sqrt(torch.clamp(wt, min=0.0))
+            elif use_scheme == "linear":
+                pass  # already linear in [0,1]
+            else:
+                raise ValueError(f"unknown time_loss_weighting={use_scheme}")
             wt = torch.clamp(wt, min=1e-3)
             loss_vec = loss_vec * wt
 
@@ -184,7 +193,11 @@ def train_epoch(
         logits = model(
             data.x, edge_index, data.timestep if _model_uses_time_embed(model) else None
         )
-        t_idx = data.timestep[data.train_mask] if "time_loss_weighting" in cfg else None
+        t_idx = (
+            data.timestep[data.train_mask]
+            if cfg.get("time_loss_weighting", "none") != "none"
+            else None
+        )
         loss = loss_fn(logits[data.train_mask], data.y[data.train_mask], t_idx)
     scaler.scale(loss).backward()
     if cfg.get("grad_clip", 0) and cfg["grad_clip"] > 0:
@@ -214,7 +227,7 @@ def train_epoch_minibatch(
             target = batch.y[: batch.batch_size]
             t_idx = (
                 batch.timestep[: batch.batch_size]
-                if "time_loss_weighting" in cfg
+                if cfg.get("time_loss_weighting", "none") != "none"
                 else None
             )
             loss = loss_fn(logits[: batch.batch_size], target, t_idx)
@@ -407,7 +420,7 @@ def main(cfg):
         data = data.to(device)
         edge_index_used = data.edge_index
 
-    # Optional temperature scaling
+    # Optional temperature scaling (old API: divide logits by learned T)
     ts = None
     use_temp_scale = bool(cfg.get("calibrate_temperature", True))
     if use_temp_scale:
@@ -481,7 +494,7 @@ def main(cfg):
         best_val_pr_auc=best_val,
     )
 
-    # -------- NEW: per-timestep PR-AUC on test --------
+    # -------- per-timestep PR-AUC on test --------
     test_ts = timestep_np[test_mask]
     if test_ts.size > 0:
         # preserve chronological order
