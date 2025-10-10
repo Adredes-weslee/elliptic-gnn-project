@@ -1,0 +1,43 @@
+run_name: rec_sage_resbn_k9_sin2
+seed: 42
+processed_dir: data/processed
+
+device: auto
+amp: true
+grad_clip: 1.0
+
+arch: sage_resbn
+hidden_dim: 64
+layers: 3
+dropout: 0.20
+weight_decay: 5.0e-5
+lr: 5.0e-4
+max_epochs: 250
+patience: 30
+mini_batch: false
+fanout: [10, 10]
+batch_size: 8192
+
+# loss / class weighting
+class_weight_pos: auto
+focal_loss: false
+
+# eval / thresholding
+use_val_for_thresholds: true
+precision_target: 0.0
+topk: 100
+
+# calibration & analysis
+calibrate_temperature: false
+ablate_hubs_frac: 0.0
+symmetrize_edges: true
+
+# time features
+use_time_scalar: false
+time_embed_dim: 2
+time_embed_type: sin
+time_embed_l2: 0.0
+time_loss_weighting: none
+
+# temporal split window
+train_window_k: 9
